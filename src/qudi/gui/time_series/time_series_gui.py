@@ -391,7 +391,9 @@ class TimeSeriesGui(GuiBase):
                 if np.isnan(val):
                     self._mw.current_value_label.setText(f'{val} {ch_unit}')
                 elif is_integer_type(constraints.data_type):
-                    self._mw.current_value_label.setText(f'{val:,d} {ch_unit}')
+                    # val may be a float for an integer channel (e.g. the moving-average trace),
+                    # so coerce before integer formatting to avoid "Unknown format code 'd'".
+                    self._mw.current_value_label.setText(f'{int(round(val)):,d} {ch_unit}')
                 elif precision is None:
                     self._mw.current_value_label.setText(f'{ScaledFloat(val):.5r}{ch_unit}')
                 else:
