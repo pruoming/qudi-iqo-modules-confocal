@@ -27,6 +27,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 import TimeTagger as tt
 
 from qudi.core.configoption import ConfigOption
+from qudi.core.connector import Connector
 from qudi.util.constraints import ScalarConstraint
 from qudi.util.mutex import Mutex
 from qudi.interface.data_instream_interface import (DataInStreamInterface, DataInStreamConstraints,
@@ -63,11 +64,17 @@ class TimeTaggerInstreamer(DataInStreamInterface):
                               constructor=lambda t: np.dtype(t).type)
     # VALIDATE: Time Tagger 20 max meaningful bin rate — placeholder cap, confirm vs specs.
     _max_sample_rate = ConfigOption(name='max_sample_rate', default=1.0e6)
+    # Optional: borrow the Time Tagger object from another module that already owns the device
+    # (e.g. confocal_scan_io), so the counter and the confocal scan share ONE Time Tagger
+    # connection. If not connected, this module opens its own (standalone counter use).
+    _tagger_provider = Connector(name='tagger_provider', interface='FiniteSamplingIOInterface',
+                                 optional=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._thread_lock = Mutex()
         self._tagger = None
+        self._owns_tagger = False
         self._counter = None
         self._constraints = None
         self._channel_names = []
@@ -86,9 +93,20 @@ class TimeTaggerInstreamer(DataInStreamInterface):
         if len(set(self._channel_names)) != len(self._channel_names):
             raise ValueError('Duplicate channel names in "channels" ConfigOption')
 
-        # Connect to the Time Tagger (read-only; no output)
-        self._tagger = tt.createTimeTagger(self._serial) if self._serial else tt.createTimeTagger()
-        self.log.info(f'Connected Time Tagger serial {self._tagger.getSerial()}')
+        # Use a shared Time Tagger if a provider module is connected, else open our own (read-only).
+        provider = None
+        try:
+            provider = self._tagger_provider()
+        except Exception:
+            provider = None
+        if provider is not None:
+            self._tagger = provider.get_tagger()
+            self._owns_tagger = False
+            self.log.info(f'Using shared Time Tagger, serial {self._tagger.getSerial()}.')
+        else:
+            self._tagger = tt.createTimeTagger(self._serial) if self._serial else tt.createTimeTagger()
+            self._owns_tagger = True
+            self.log.info(f'Connected own Time Tagger, serial {self._tagger.getSerial()}.')
 
         unit = 'c/s' if self._report_count_rate else 'counts'
         self._constraints = DataInStreamConstraints(
@@ -115,9 +133,10 @@ class TimeTaggerInstreamer(DataInStreamInterface):
         except Exception:
             pass
         self._counter = None
-        if self._tagger is not None:
+        # Only free the device if we opened it ourselves (a borrowed tagger is owned elsewhere).
+        if self._owns_tagger and self._tagger is not None:
             tt.freeTimeTagger(self._tagger)
-            self._tagger = None
+        self._tagger = None
 
     # ----- read-only properties -------------------------------------------------------------
     @property

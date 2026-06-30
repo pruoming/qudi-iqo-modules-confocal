@@ -1,0 +1,516 @@
+# -*- coding: utf-8 -*-
+
+"""
+Qudi hardware module (confocal_odmr): FiniteSamplingIO that produces one confocal scan frame by
+coordinating three devices, all driven from the Pulse Streamer master clock:
+
+  * NI AO  -- piezo x/y/z voltages played as a JUMP_LIST, EXTERNALLY sample-clocked on PFI0
+  * Time Tagger -- per-pixel gated photon counts (CountBetweenMarkers on the 'detect' marker)
+  * Pulse Streamer -- per-pixel sequence: mw-switch gate (ch4), detect count-gate (ch1),
+                      pixel-advance clock (ch5 -> PFI0), and (optionally) laser gate (ch0)
+
+It implements FiniteSamplingIOInterface so the stock ni_scanning_probe_interfuse + scanning
+logic + Scanner GUI can be reused unchanged (see Qudi_AI/setups/confocal_odmr/
+confocal_scanner_design.md). Written from scratch from the operator's spec (2026-06-26).
+
+Per-pixel timing (pixel duration T = 1/sample_rate; accumulate fraction default 0.9):
+    ch4 mw     : HIGH [0, T/2)            LOW [T/2, T)
+    ch1 detect : HIGH [skip, T/2)  and  HIGH [T/2+skip, T)     where skip = (1-accumulate)/2 * T
+    ch5 next   : short rising pulse at the end of the pixel  -> advances NI AO
+    ch0 laser  : HIGH for whole scan IFF enable_laser (human-approved); else untouched/off
+The Time Tagger returns 2 windows/pixel: A (mw-on half) and B (mw-off half).
+    sum mode  : A + B   (normal confocal PL)
+    diff mode : A - B   (mw response; requires SMIQ RF on continuously -- human approval)
+
+SAFETY / STATUS: FIRST DRAFT. Counting and (with the piezo off) AO output are read-only-ish, but
+this module drives the piezo (motion) and can gate the laser. Validate with the piezo OFF and
+laser OFF first (dark-count image). Lines marked `# VALIDATE` need a hardware dry-run to confirm
+(esp. NI external-clock alignment / pixel_next off-by-one, getData timing, normalization).
+Measurement correctness needs human/expert validation. Codex review advised.
+
+This file is part of qudi. Licensed under LGPL v3.
+"""
+
+import time
+import numpy as np
+from typing import Dict, List, Optional, Sequence as TSequence, Union
+
+import nidaqmx
+from nidaqmx.constants import AcquisitionType, Edge
+import pulsestreamer as ps
+import TimeTagger as tt
+
+from qudi.core.configoption import ConfigOption
+from qudi.util.mutex import Mutex
+from qudi.util.constraints import ScalarConstraint
+from qudi.interface.finite_sampling_io_interface import (FiniteSamplingIOInterface,
+                                                         FiniteSamplingIOConstraints)
+from qudi.util.enums import SamplingOutputMode
+
+
+class ConfocalScanIO(FiniteSamplingIOInterface):
+    """
+    Example config:
+
+    confocal_scan_io:
+        module.Class: 'interfuse.confocal_scan_io.ConfocalScanIO'
+        options:
+            ni_device: 'Dev1'
+            ao_channels: ['ao0', 'ao1', 'ao2']  # NI AO terminals = this module's output channel
+                                                # names. The ni_scanning_probe_interfuse maps the
+                                                # scan axes x/y/z -> these via its ni_channel_mapping.
+            ao_voltage_limits: [0.0, 10.0]      # piezo input range (human-confirmed)
+            ni_sample_clock_terminal: '/Dev1/PFI0'   # external clock from pulse_streamer ch5
+            pulsestreamer_ip: '169.254.8.2'
+            ps_channels:                 # Pulse Streamer digital channels (connections.yaml)
+                mw: 4
+                detect: 1
+                pixel_next: 5
+                laser: 0
+            timetagger_serial: ''        # optional; '' -> the only Time Tagger
+            apd_channels: [1, 2]         # Time Tagger click channels (APD1, APD2)
+            detect_tt_channel: 5         # Time Tagger channel receiving the 'detect' marker
+            input_channel_name: 'fluorescence'
+            accumulate_fraction: 0.9     # fraction of the pixel actually counted (tunable)
+            scan_mode: 'sum'             # 'sum' (PL) or 'diff' (mw response; needs RF on)
+            pixel_next_pulse_ns: 100     # width of the AO-advance pulse
+            enable_laser: False          # True drives ch0 laser HIGH during scan -- HUMAN APPROVAL
+            default_sample_rate: 200.0   # Hz -> 5 ms pixel
+    """
+    _ni_device = ConfigOption('ni_device', default='Dev1', missing='warn')
+    _ao_channels = ConfigOption('ao_channels', missing='error')
+    _ao_voltage_limits = ConfigOption('ao_voltage_limits', default=(0.0, 10.0))
+    _ni_clk_terminal = ConfigOption('ni_sample_clock_terminal', default='/Dev1/PFI0')
+    _ps_ip = ConfigOption('pulsestreamer_ip', missing='error')
+    _ps_channels = ConfigOption('ps_channels', missing='error')
+    _tt_serial = ConfigOption('timetagger_serial', default='')
+    _apd_channels = ConfigOption('apd_channels', missing='error')
+    _detect_tt_channel = ConfigOption('detect_tt_channel', default=5)
+    _input_channel_name = ConfigOption('input_channel_name', default='fluorescence')
+    _accumulate_fraction = ConfigOption('accumulate_fraction', default=0.9)
+    _scan_mode = ConfigOption('scan_mode', default='sum')
+    _pixel_next_pulse_ns = ConfigOption('pixel_next_pulse_ns', default=100)
+    _enable_laser = ConfigOption('enable_laser', default=False)
+    # idle_laser_on: hold the laser ON while the module is idle (not scanning) — for cursor /
+    # positioning tests where you watch the back-reflection. HUMAN-APPROVED continuous laser
+    # output; default False. (enable_laser above controls the laser DURING a scan sequence.)
+    _idle_laser_on = ConfigOption('idle_laser_on', default=False)
+    _default_sample_rate = ConfigOption('default_sample_rate', default=200.0)
+    # safety net: max seconds to wait for a Time Tagger frame before aborting (so a missing detect
+    # marker can't block the scan forever). None -> auto (expected frame time x2 + 5 s).
+    _frame_timeout = ConfigOption('frame_timeout', default=None)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lock = Mutex()
+        self._tagger = None
+        self._pulser = None
+        self._constraints = None
+        # active scan/frame state
+        self._sample_rate = 0.0
+        self._frame_size = 0
+        self._output_mode = SamplingOutputMode.JUMP_LIST
+        self._active_out = []
+        self._active_in = []
+        self._frame_voltages = None         # dict ao-axis -> np.ndarray (N,)
+        self._ao_task = None
+        self._cbm = None                    # TimeTagger.CountBetweenMarkers
+        self._combiner = None
+        self._detect_monitor = None         # TimeTagger.Countrate on the detect channel (diagnostic)
+        self._consumed_pixels = 0
+        self._frame_pixels = None
+        self._laser_is_on = False   # tracks the intended laser state (idle config / laser_on())
+        self._frame_start_time = None
+        # Samples snapshotted at teardown so get_buffered_samples can still drain them AFTER the
+        # frame has stopped (stock ni_x_series_finite_sampling_io contract; see SCAN-003).
+        self._unread = None
+
+    # ---------------------------------------------------------------- lifecycle
+    def on_activate(self):
+        self._pulser = ps.PulseStreamer(self._ps_ip)
+        self._tagger = tt.createTimeTagger(self._tt_serial) if self._tt_serial else tt.createTimeTagger()
+        # Set a defined output state at activation.
+        if self._idle_laser_on:
+            self._pulser.constant(ps.OutputState([int(self._ps_channels['laser'])], 0, 0))
+            self._laser_is_on = True
+            self.log.warning('LASER ON at activation (idle_laser_on=True): human-approved continuous '
+                             'laser output for a positioning test; Pulse Streamer laser channel HIGH.')
+        else:
+            self._pulser.constant(ps.OutputState.ZERO())  # all outputs LOW (laser/mw OFF)
+            self._laser_is_on = False
+
+        lo, hi = float(self._ao_voltage_limits[0]), float(self._ao_voltage_limits[1])
+        out_units = {ax: 'V' for ax in self._ao_channels}
+        out_limits = {ax: (lo, hi) for ax in self._ao_channels}
+        in_units = {self._input_channel_name: 'c/s'}
+        self._constraints = FiniteSamplingIOConstraints(
+            supported_output_modes=(SamplingOutputMode.JUMP_LIST,),
+            input_channel_units=in_units,
+            output_channel_units=out_units,
+            input_channel_limits={self._input_channel_name: (-np.inf, np.inf)},
+            output_channel_limits=out_limits,
+            frame_size_limits=(1, int(1e7)),
+            sample_rate_limits=(0.1, 1e4),  # VALIDATE vs Pulse Streamer / piezo bandwidth
+        )
+        self._sample_rate = float(self._default_sample_rate)
+        self._active_out = list(self._ao_channels)
+        self._active_in = [self._input_channel_name]
+
+    def on_deactivate(self):
+        try:
+            self.stop_buffered_frame()
+        except Exception:
+            pass
+        if self._pulser is not None:
+            try:
+                self._pulser.constant(ps.OutputState.ZERO())  # leave all outputs LOW (safe)
+            except Exception:
+                pass
+        if self._tagger is not None:
+            tt.freeTimeTagger(self._tagger)
+            self._tagger = None
+        self._pulser = None
+
+    # ---------------------------------------------------------------- properties
+    @property
+    def constraints(self):
+        return self._constraints
+
+    @property
+    def active_channels(self):
+        return list(self._active_in), list(self._active_out)
+
+    @property
+    def sample_rate(self):
+        return self._sample_rate
+
+    @property
+    def frame_size(self):
+        return self._frame_size
+
+    @property
+    def output_mode(self):
+        return self._output_mode
+
+    @property
+    def is_running(self):
+        """ True while a buffered frame is being acquired (module_state locked).
+        Not part of the FiniteSamplingIOInterface ABC, but the ni_scanning_probe_interfuse
+        relies on it (e.g. in on_deactivate), so the stock NI module and this one both provide it.
+        """
+        return self.module_state() == 'locked'
+
+    @property
+    def samples_in_buffer(self):
+        # After a frame has stopped, report whatever was snapshotted as still-unread so the
+        # interfuse can drain it; never report a stale live count when not locked (see SCAN-003).
+        if self.module_state() != 'locked':
+            if self._unread is not None:
+                return int(len(self._unread.get(self._input_channel_name, [])))
+            return 0
+        if self._cbm is None:
+            return 0
+        return max(0, self._available_pixels_total() - self._consumed_pixels)
+
+    # ---------------------------------------------------------------- configuration
+    def set_sample_rate(self, rate):
+        lo, hi = self._constraints.sample_rate_limits
+        if not (lo <= float(rate) <= hi):
+            raise ValueError(f'Sample rate {rate} out of bounds {(lo, hi)}')
+        self._sample_rate = float(rate)
+
+    def set_active_channels(self, input_channels, output_channels):
+        self._active_in = list(input_channels)
+        self._active_out = list(output_channels)
+
+    def set_output_mode(self, mode):
+        if SamplingOutputMode(mode) != SamplingOutputMode.JUMP_LIST:
+            raise ValueError('ConfocalScanIO only supports JUMP_LIST output mode')
+        self._output_mode = SamplingOutputMode.JUMP_LIST
+
+    def set_frame_data(self, data):
+        if data is None:
+            self._frame_voltages = None
+            self._frame_size = 0
+            return
+        sizes = {len(v) for v in data.values()}
+        if len(sizes) != 1:
+            raise ValueError('All output channel arrays must have equal length')
+        self._frame_voltages = {ch: np.asarray(v, dtype=np.float64) for ch, v in data.items()}
+        self._frame_size = sizes.pop()
+
+    # ---------------------------------------------------------------- Pulse Streamer sequence
+    def _build_pixel_sequence(self):
+        """ One pixel block (duration T = 1/sample_rate). Streamed n_runs = frame_size times. """
+        T_ns = int(round(1e9 / self._sample_rate))
+        half = T_ns // 2
+        skip = int(round((1.0 - float(self._accumulate_fraction)) / 2.0 * T_ns))
+        pw = int(min(self._pixel_next_pulse_ns, max(1, T_ns // 100)))
+        ch = self._ps_channels
+
+        seq = self._pulser.createSequence()
+        # mw switch: high first half, low second half
+        seq.setDigital(ch['mw'], [(half, 1), (T_ns - half, 0)])
+        # detect: [skip low][window A high][skip low][window B high][tail low].
+        # The trailing 'tail' low keeps window B's falling edge INSIDE the pixel block, so every
+        # count window closes within its own pixel -- including the last one. Relying on the
+        # inter-block boundary / post-sequence final state left the last window open (off-by-one
+        # timeout: 14999/15000). 'tail' is tiny (~pixel_next pulse width) so the lost integration
+        # time is negligible.
+        tail = pw
+        seq.setDigital(ch['detect'], [(skip, 0), (half - skip, 1),
+                                      (skip, 0), (T_ns - half - skip - tail, 1), (tail, 0)])
+        # pixel_next: advance pulse at the very end of the pixel
+        seq.setDigital(ch['pixel_next'], [(T_ns - pw, 0), (pw, 1)])
+        # laser: held HIGH for the whole pixel if the laser is meant to be ON during the scan
+        # (enable_laser) or was already on for positioning (idle_laser_on). Otherwise left LOW.
+        # Without this, the scan sequence would drive the laser channel LOW and turn off a laser
+        # that was on before the scan.
+        if self._enable_laser or self._laser_is_on:
+            seq.setDigital(ch['laser'], [(T_ns, 1)])
+        return seq
+
+    # ---------------------------------------------------------------- frame control
+    def start_buffered_frame(self):
+        with self._lock:
+            if self.module_state() == 'locked':
+                raise RuntimeError('Frame already running')
+            if self._frame_voltages is None or self._frame_size < 1:
+                raise RuntimeError('No frame data set')
+            self.module_state.lock()
+            try:
+                n = self._frame_size
+                # 1) NI AO buffered task, EXTERNALLY clocked on PFI0 (from pulse_streamer ch5)
+                self._ao_task = nidaqmx.Task()
+                for ch in self._active_out:                 # ch is the NI AO terminal (e.g. 'ao0')
+                    term = f"{self._ni_device}/{ch}"
+                    lo, hi = self._ao_voltage_limits
+                    self._ao_task.ao_channels.add_ao_voltage_chan(term, min_val=lo, max_val=hi)
+                self._ao_task.timing.cfg_samp_clk_timing(
+                    rate=self._sample_rate,                      # hint; real timing is external
+                    source=self._ni_clk_terminal,               # '/Dev1/PFI0'
+                    active_edge=Edge.RISING,
+                    sample_mode=AcquisitionType.FINITE,
+                    samps_per_chan=n)
+                # write JUMP_LIST in active-channel order  # VALIDATE: pixel_next vs sample alignment
+                write_arr = np.vstack([self._frame_voltages[ax] for ax in self._active_out])
+                self._ao_task.write(write_arr, auto_start=False)
+                self._ao_task.start()  # armed; waits for external clock edges
+
+                # 2) Time Tagger: combine APDs, count between detect rising/falling -> 2 windows/pixel
+                self._combiner = tt.Combiner(self._tagger, channels=list(self._apd_channels))
+                self._cbm = tt.CountBetweenMarkers(
+                    self._tagger,
+                    click_channel=self._combiner.getChannel(),
+                    begin_channel=int(self._detect_tt_channel),
+                    end_channel=-int(self._detect_tt_channel),  # falling edge of same channel
+                    n_values=2 * n)
+                # diagnostic: count detect edges actually arriving at the Time Tagger during the frame
+                self._detect_monitor = tt.Countrate(self._tagger, [int(self._detect_tt_channel)])
+                self._consumed_pixels = 0
+                self._frame_pixels = None
+                self._unread = None   # clear any leftover snapshot from a previous frame
+
+                # 3) Pulse Streamer: play the pixel block n times (drives AO + gates TT).
+                # Software-trigger + explicit startNow() so the clock starts AFTER NI AO and the
+                # Time Tagger are armed. Without an explicit start, stream() can leave the sequence
+                # idle -> no detect markers -> the Time Tagger never completes (the observed hang).
+                # Immediate-start trigger: the sequence runs as soon as it is streamed (NI AO and
+                # the Time Tagger are already armed above, so they catch the first clock/markers).
+                # final=ZERO so the detect line drops LOW after the last pixel -> that final detect
+                # falling edge closes the last count window. Without it, CountBetweenMarkers waits
+                # forever for the (2*N)-th window's closing marker and the frame times out.
+                self._pulser.setTrigger(start=ps.TriggerStart.IMMEDIATE)
+                self._pulser.stream(self._build_pixel_sequence(), n, ps.OutputState.ZERO())
+                self._frame_start_time = time.perf_counter()
+            except Exception:
+                self._teardown()
+                self.module_state.unlock()
+                raise
+
+    def stop_buffered_frame(self):
+        with self._lock:
+            if self.module_state() == 'locked':
+                self._teardown()
+                self.module_state.unlock()
+
+    def _teardown(self):
+        # Snapshot any not-yet-consumed pixels BEFORE releasing the CountBetweenMarkers measurement,
+        # so get_buffered_samples can still hand them back after the frame stops (the stock
+        # ni_x_series_finite_sampling_io guarantees "return all available samples already read into
+        # buffer" after a stop; the interfuse fetch loop relies on it -- see SCAN-003).
+        try:
+            if self._cbm is not None and self._frame_size:
+                pixels = self._windows_to_pixels(np.asarray(self._cbm.getData()))
+                remaining = np.asarray(pixels[self._consumed_pixels:self._frame_size],
+                                       dtype=np.float64)
+                self._unread = {self._input_channel_name: remaining}
+        except Exception:
+            self._unread = {self._input_channel_name: np.array([], dtype=np.float64)}
+        try:
+            if self._pulser is not None:
+                # Return to the intended idle state: keep the laser ON if it was on (so it does not
+                # blink off between scan frames), else all outputs LOW. on_deactivate forces zero
+                # for a safe shutdown.
+                if self._laser_is_on:
+                    self._pulser.constant(ps.OutputState([int(self._ps_channels['laser'])], 0, 0))
+                else:
+                    self._pulser.constant(ps.OutputState.ZERO())
+        except Exception:
+            pass
+        if self._ao_task is not None:
+            try:
+                self._ao_task.stop()
+            finally:
+                self._ao_task.close()
+            self._ao_task = None
+        self._cbm = None
+        self._combiner = None
+        self._detect_monitor = None
+
+    # ---------------------------------------------------------------- manual laser control
+    def laser_on(self):
+        """ Turn the laser ON continuously: Pulse Streamer 'laser' channel HIGH, all others LOW.
+
+        HUMAN-APPROVED LASER OUTPUT. Intended for static positioning tests (drag the cursor in the
+        Scanner GUI -> the piezo moves -> watch the back-reflection). Single owner of the Pulse
+        Streamer connection, so there is no device contention with the scan path. Refuses to run
+        while a scan frame is active. Call laser_off() to switch it back off.
+        """
+        with self._lock:
+            if self.module_state() == 'locked':
+                raise RuntimeError('Refusing to toggle the laser during a running scan frame.')
+            self._pulser.constant(ps.OutputState([int(self._ps_channels['laser'])], 0, 0))
+            self._laser_is_on = True
+            self.log.warning('LASER ON (continuous): Pulse Streamer laser channel held HIGH '
+                             '(human-approved laser output). Call laser_off() when done.')
+
+    def laser_off(self):
+        """ Switch the laser OFF: Pulse Streamer outputs all zero. """
+        with self._lock:
+            self._pulser.constant(ps.OutputState.ZERO())
+            self._laser_is_on = False
+            self.log.info('Laser OFF: Pulse Streamer outputs all zero.')
+
+    def get_tagger(self):
+        """ Return the underlying TimeTagger object so another module (e.g. a live photon counter)
+        can run additional measurements on the SAME device. The Time Tagger supports multiple
+        concurrent measurements on one connection, whereas a second createTimeTagger() for the same
+        device would fail. """
+        return self._tagger
+
+    # ---------------------------------------------------------------- readout
+    def _windows_to_pixels(self, counts_2n):
+        T = 1.0 / self._sample_rate
+        win_time = (float(self._accumulate_fraction) / 2.0) * T  # per-window integration time
+        ab = np.asarray(counts_2n, dtype=np.float64).reshape(-1, 2)  # (pixels, [A, B])
+        a, b = ab[:, 0], ab[:, 1]
+        if str(self._scan_mode).lower() == 'diff':
+            return (a - b) / win_time                 # VALIDATE: diff normalization
+        return (a + b) / (2.0 * win_time)             # sum -> mean count rate in c/s
+
+    def _available_pixels_total(self):
+        """ Pixels whose BOTH count windows have actually closed, read from the Time Tagger itself.
+        CountBetweenMarkers.getBinWidths() returns the accumulation time of each window: a closed
+        window has width > 0, a not-yet-closed window has width 0 -- independent of photon counts,
+        so it works with the laser off (unlike counting nonzero photon counts). 2 windows per pixel.
+        Snaps to the full frame once the NI AO has output every pixel (line physically finished). """
+        if self._cbm is None:
+            return 0
+        try:
+            closed_windows = int(np.count_nonzero(np.asarray(self._cbm.getBinWidths())))
+        except Exception:
+            closed_windows = 0
+        completed = closed_windows // 2
+        try:
+            if self._ao_task is not None and self._ao_task.is_task_done():
+                return self._frame_size
+        except Exception:
+            pass
+        return max(0, min(completed, self._frame_size))
+
+    def _log_scan_timeout(self, timeout):
+        try:
+            detect_rate = float(self._detect_monitor.getData()[0])
+        except Exception:
+            detect_rate = -1.0
+        try:
+            closed_windows = int(np.count_nonzero(np.asarray(self._cbm.getBinWidths())))
+        except Exception:
+            closed_windows = -1
+        self.log.error(
+            f'Scan frame timed out after {timeout:.1f} s ({self._frame_size} px @ '
+            f'{self._sample_rate} Hz). DIAGNOSTICS: detect-edge rate during scan = '
+            f'{detect_rate:.0f}/s (expect ~{2 * self._sample_rate:.0f}); CountBetweenMarkers '
+            f'CLOSED windows (getBinWidths>0) = {closed_windows} of {2 * self._frame_size}. '
+            f'detect~0 -> markers not reaching TT; closed~N -> 2nd window not closing; '
+            f'closed~2N-1 -> last window. Returning blank for the rest of the frame.')
+
+    def get_buffered_samples(self, number_of_samples=None):
+        with self._lock:
+            # Frame already stopped/finished: hand back any snapshotted unread samples and then
+            # empty -- NEVER raise RuntimeError here. The stock ni_x_series_finite_sampling_io keeps
+            # returning buffered/empty samples after a stop, and the ni_scanning_probe_interfuse
+            # fetch loop polls once more after stopping (the optimizer runs many short scans, so it
+            # hits this every time). Raising RuntimeError escaped the interfuse's `except ValueError`
+            # into its generic handler -> a second stop_scan() -> unlock-while-idle FysomError
+            # (SCAN-003). Match the stock contract: ValueError only when more is requested than
+            # pending; otherwise drain.
+            if self.module_state() != 'locked':
+                buf = self._unread if self._unread is not None \
+                    else {self._input_channel_name: np.array([], dtype=np.float64)}
+                have = int(len(buf.get(self._input_channel_name, [])))
+                if number_of_samples is None:
+                    self._unread = {self._input_channel_name: np.array([], dtype=np.float64)}
+                    return {k: np.asarray(v, dtype=np.float64) for k, v in buf.items()}
+                n = int(number_of_samples)
+                if n > have:
+                    raise ValueError(f'Requested {n} samples but only {have} pending after stop')
+                arr = np.asarray(buf[self._input_channel_name], dtype=np.float64)
+                self._unread = {self._input_channel_name: arr[n:]}
+                return {self._input_channel_name: arr[:n]}
+            timeout = float(self._frame_timeout) if self._frame_timeout else \
+                (self._frame_size / max(self._sample_rate, 1e-9)) * 2.0 + 5.0
+            deadline = time.perf_counter() + timeout
+            # Samples still belonging to this frame (not yet handed out). NEVER block for more than
+            # this many: at end-of-frame the interfuse always asks for a full chunk (chunk_size=10)
+            # even when only a couple of pixels remain (e.g. frame_size 512 or 32 -> 2 left). The
+            # old code waited for the full chunk of NEW pixels that can never arrive once the frame
+            # is complete, so it spun until the frame timeout (SCAN-004). Match the stock
+            # ni_x_series_finite_sampling_io: raise ValueError when more is requested than the frame
+            # has left -- the interfuse catches that (its `except ValueError`) and re-fetches without
+            # a count, draining the remainder. Manual scans with a frame_size that is a multiple of
+            # 10 never showed it; the optimizer's odd frame sizes do.
+            pending_in_frame = self._frame_size - self._consumed_pixels
+            if pending_in_frame <= 0:
+                return {self._input_channel_name: np.array([], dtype=np.float64)}
+            if number_of_samples is not None and int(number_of_samples) > pending_in_frame:
+                raise ValueError(f'Requested {number_of_samples} samples but only '
+                                 f'{pending_in_frame} pending in this frame')
+            target = 1 if number_of_samples is None else int(number_of_samples)
+            # Progressive: block only until enough NEW pixels are ready, so the interfuse fetches
+            # and displays the image chunk-by-chunk (line-by-line) instead of all-at-once.
+            while (self._available_pixels_total() - self._consumed_pixels) < target:
+                if time.perf_counter() > deadline:
+                    self._log_scan_timeout(timeout)
+                    self._teardown()
+                    remaining = self._frame_size - self._consumed_pixels
+                    self._consumed_pixels = self._frame_size
+                    return {self._input_channel_name: np.zeros(remaining, dtype=np.float64)}
+                time.sleep(min(max(1.0 / self._sample_rate, 1e-3), 0.05))
+            avail = self._available_pixels_total() - self._consumed_pixels
+            n = avail if number_of_samples is None else min(int(number_of_samples), avail)
+            pixels = self._windows_to_pixels(np.asarray(self._cbm.getData()))  # length frame_size
+            block = pixels[self._consumed_pixels:self._consumed_pixels + n]
+            self._consumed_pixels += n
+            return {self._input_channel_name: block}
+
+    def get_frame(self, data):
+        """ Convenience: configure output frame, run it, and return the input samples. """
+        if data is not None:
+            self.set_frame_data(data)
+        self.start_buffered_frame()
+        try:
+            return self.get_buffered_samples()
+        finally:
+            self.stop_buffered_frame()
