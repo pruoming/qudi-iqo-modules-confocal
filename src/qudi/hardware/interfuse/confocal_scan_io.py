@@ -99,6 +99,21 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
     # safety net: max seconds to wait for a Time Tagger frame before aborting (so a missing detect
     # marker can't block the scan forever). None -> auto (expected frame time x2 + 5 s).
     _frame_timeout = ConfigOption('frame_timeout', default=None)
+    # Post-ramp piezo settle (seconds): a SHORT dwell at the start of every buffered frame, i.e. AFTER
+    # the reused ni_scanning_probe_interfuse has ramped the AO to the first scan position and BEFORE the
+    # first pixel is clocked. The interfuse starts the scan the instant the AO *setpoint* reaches
+    # target, with no wait for the physical piezo. The velocity ramp (interfuse maximum_move_velocity)
+    # handles the DISTANCE-DEPENDENT part of the move; what remains at ramp-end is a small, roughly
+    # CONSTANT following-error residual (~ velocity * piezo_time_constant, independent of move size),
+    # which this fixed dwell lets decay. So -- unlike a settle-only scheme -- a small fixed value works
+    # regardless of how far the stage moved. The AO holds the target during the dwell (nicard_ao uses
+    # keep_value: True). HARDWARE-SPECIFIC: tune to the piezo; 0 disables. (SCAN-005)
+    _settle_time = ConfigOption('settle_time', default=0.05)
+    # Arm the Time Tagger measurements before starting the Pulse Streamer clock. A freshly created
+    # CountBetweenMarkers needs ~tens of ms to start listening; without this, the first detect edges
+    # are lost by a variable amount -> count<->position registration slip (SCAN-006). Applied on top
+    # of tagger.sync(); >=0.05 s was proven sufficient at 1 kHz (probe_scan_registration.py).
+    _cbm_arm_delay = ConfigOption('cbm_arm_delay', default=0.05)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -127,6 +142,15 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
 
     # ---------------------------------------------------------------- lifecycle
     def on_activate(self):
+        # Validate timing-critical config up front (before touching hardware) so a typo fails fast
+        # with a clear message instead of producing negative Pulse Streamer segment durations or a
+        # late error mid-scan (Codex review #4).
+        if not (0.0 < float(self._accumulate_fraction) < 1.0):
+            raise ValueError(f'accumulate_fraction must be in (0, 1), got {self._accumulate_fraction}')
+        if int(self._pixel_next_pulse_ns) <= 0:
+            raise ValueError(f'pixel_next_pulse_ns must be positive, got {self._pixel_next_pulse_ns}')
+        if str(self._scan_mode).lower() not in ('sum', 'diff'):
+            raise ValueError(f"scan_mode must be 'sum' or 'diff', got {self._scan_mode}")
         self._pulser = ps.PulseStreamer(self._ps_ip)
         self._tagger = tt.createTimeTagger(self._tt_serial) if self._tt_serial else tt.createTimeTagger()
         # Set a defined output state at activation.
@@ -277,8 +301,22 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
                 raise RuntimeError('Frame already running')
             if self._frame_voltages is None or self._frame_size < 1:
                 raise RuntimeError('No frame data set')
+            # Every active output channel must have frame voltages, else the np.vstack below raises a
+            # late, opaque KeyError. Fail early with a clear message (Codex review #4).
+            missing = [ax for ax in self._active_out if ax not in self._frame_voltages]
+            if missing:
+                raise RuntimeError(f'Frame data missing voltages for active output channel(s) '
+                                   f'{missing}; have {list(self._frame_voltages)}')
             self.module_state.lock()
             try:
+                # Post-ramp piezo settle: the interfuse has just finished ramping the AO to the first
+                # scan position and starts us with NO wait for the stage to catch up. Dwell a short,
+                # fixed time so the residual following-error decays before the first pixel is clocked.
+                # The AO holds the target during this (nicard_ao keep_value: True), and we haven't
+                # created our AO task yet, so nothing perturbs the output. The velocity ramp does the
+                # bulk (distance-dependent) move; this only covers the small constant residual. SCAN-005.
+                if self._settle_time and float(self._settle_time) > 0:
+                    time.sleep(float(self._settle_time))
                 n = self._frame_size
                 # 1) NI AO buffered task, EXTERNALLY clocked on PFI0 (from pulse_streamer ch5)
                 self._ao_task = nidaqmx.Task()
@@ -311,6 +349,22 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
                 self._frame_pixels = None
                 self._unread = None   # clear any leftover snapshot from a previous frame
 
+                # ARM BARRIER (SCAN-006): a freshly created CountBetweenMarkers takes time (~tens of
+                # ms) to actually start listening. If the Pulse Streamer starts before it is armed, a
+                # VARIABLE number of the first 'detect' edges are lost, so the count<->position
+                # registration slips by a random integer pixel each frame -- invisible in a single 2D
+                # frame (one global offset), but visible as run-to-run drift in repeated 1D line scans.
+                # tagger.sync() is the Time Tagger's barrier (blocks until the measurements are
+                # initialized); the short fixed cbm_arm_delay is a proven belt-and-suspenders margin
+                # (probe_scan_registration.py: >=0.05 s -> 200/200 windows every frame). Guarded so a
+                # missing sync() can't break start-up -- the delay alone already fixes it.
+                try:
+                    self._tagger.sync()
+                except Exception:
+                    pass
+                if self._cbm_arm_delay and float(self._cbm_arm_delay) > 0:
+                    time.sleep(float(self._cbm_arm_delay))
+
                 # 3) Pulse Streamer: play the pixel block n times (drives AO + gates TT).
                 # Software-trigger + explicit startNow() so the clock starts AFTER NI AO and the
                 # Time Tagger are armed. Without an explicit start, stream() can leave the sequence
@@ -335,15 +389,19 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
                 self.module_state.unlock()
 
     def _teardown(self):
-        # Snapshot any not-yet-consumed pixels BEFORE releasing the CountBetweenMarkers measurement,
-        # so get_buffered_samples can still hand them back after the frame stops (the stock
-        # ni_x_series_finite_sampling_io guarantees "return all available samples already read into
-        # buffer" after a stop; the interfuse fetch loop relies on it -- see SCAN-003).
+        # Snapshot only the pixels actually ACQUIRED (both count windows CLOSED) and not yet
+        # consumed, BEFORE releasing the CountBetweenMarkers measurement, so get_buffered_samples can
+        # hand them back after the frame stops. The stock ni_x_series_finite_sampling_io contract is
+        # "return samples already in the buffer", NOT all remaining frame positions: unclosed tail
+        # windows read as zeros via getData() and must not be passed off as real data on a manual
+        # stop / abort / genuine tail shortfall (Codex review #2). getBinWidths() gives the closed-
+        # window count independent of photon count (same basis as SCAN-002).
         try:
             if self._cbm is not None and self._frame_size:
+                closed_windows = int(np.count_nonzero(np.asarray(self._cbm.getBinWidths())))
+                available = max(0, min(closed_windows // 2, self._frame_size))
                 pixels = self._windows_to_pixels(np.asarray(self._cbm.getData()))
-                remaining = np.asarray(pixels[self._consumed_pixels:self._frame_size],
-                                       dtype=np.float64)
+                remaining = np.asarray(pixels[self._consumed_pixels:available], dtype=np.float64)
                 self._unread = {self._input_channel_name: remaining}
         except Exception:
             self._unread = {self._input_channel_name: np.array([], dtype=np.float64)}
@@ -358,12 +416,28 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
                     self._pulser.constant(ps.OutputState.ZERO())
         except Exception:
             pass
+        # NI AO cleanup must never escape _teardown -- otherwise stop_buffered_frame()/
+        # start_buffered_frame() could leave module_state locked (Codex review #3). Guard stop() and
+        # close() separately and always drop the task reference.
         if self._ao_task is not None:
             try:
                 self._ao_task.stop()
-            finally:
+            except Exception:
+                pass
+            try:
                 self._ao_task.close()
+            except Exception:
+                pass
             self._ao_task = None
+        # Defensively stop the Time Tagger measurements before dropping the references, mirroring the
+        # upstream Time Tagger pattern (Codex review #5). Guarded so a missing method can't break
+        # teardown. (Combiner is a virtual channel, not a measurement -- just drop it.)
+        for _meas in (self._cbm, self._detect_monitor):
+            try:
+                if _meas is not None:
+                    _meas.stop()
+            except Exception:
+                pass
         self._cbm = None
         self._combiner = None
         self._detect_monitor = None
@@ -496,6 +570,10 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
                     self._teardown()
                     remaining = self._frame_size - self._consumed_pixels
                     self._consumed_pixels = self._frame_size
+                    # We return zeros for the ENTIRE rest of the frame here, so discard the
+                    # teardown snapshot -- otherwise a later idle read would re-emit those same
+                    # positions as real data on top of the zeros (Codex review #2).
+                    self._unread = {self._input_channel_name: np.array([], dtype=np.float64)}
                     return {self._input_channel_name: np.zeros(remaining, dtype=np.float64)}
                 time.sleep(min(max(1.0 / self._sample_rate, 1e-3), 0.05))
             avail = self._available_pixels_total() - self._consumed_pixels
@@ -511,6 +589,9 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             self.set_frame_data(data)
         self.start_buffered_frame()
         try:
-            return self.get_buffered_samples()
+            # Request the WHOLE frame (not a no-arg call, which after SCAN-002 returns only the
+            # currently-available pixels and would let the finally-stop abort the frame early).
+            # Matches the stock ni_x_series_finite_sampling_io.get_frame (Codex review #1).
+            return self.get_buffered_samples(self.frame_size)
         finally:
             self.stop_buffered_frame()
