@@ -156,7 +156,8 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
         self._unread = None
         # per-window integration time (s), set when the pixel sequence is built (depends on the
         # per-pixel settle gap); used for the c/s normalization in _windows_to_pixels (SCAN-007).
-        self._win_time = None
+        self._win_time = None      # window A duration (s) -- diff mode / fallback
+        self._sum_time = None      # actual total count-window duration win_a+win_b (s) -- sum mode
 
     # ---------------------------------------------------------------- lifecycle
     def on_activate(self):
@@ -169,6 +170,14 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             raise ValueError(f'pixel_next_pulse_ns must be positive, got {self._pixel_next_pulse_ns}')
         if str(self._scan_mode).lower() not in ('sum', 'diff'):
             raise ValueError(f"scan_mode must be 'sum' or 'diff', got {self._scan_mode}")
+        # Timing gaps/delays must be non-negative: a negative pixel_settle_time would feed a negative
+        # segment into _build_pixel_sequence, which _seg() would silently drop and deform the pulse
+        # pattern instead of failing loudly (Codex review). settle_time/cbm_arm_delay < 0 are benign
+        # (guarded at use) but rejected here too for a clear failure.
+        for _name in ('_pixel_settle_time', '_settle_time', '_cbm_arm_delay'):
+            _val = getattr(self, _name)
+            if _val is not None and float(_val) < 0:
+                raise ValueError(f'{_name[1:]} must be >= 0, got {_val}')
         self._pulser = ps.PulseStreamer(self._ps_ip)
         self._tagger = tt.createTimeTagger(self._tt_serial) if self._tt_serial else tt.createTimeTagger()
         # Set a defined output state at activation.
@@ -268,6 +277,8 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
     def set_pixel_settle_time(self, seconds):
         """ Runtime setter for the per-pixel settle gap (s), so it can be swept from the qudi console
         without relaunching (SCAN-007 tuning). Takes effect on the NEXT scan; refuses during one. """
+        if float(seconds) < 0:
+            raise ValueError(f'pixel_settle_time must be >= 0, got {seconds}')
         with self._lock:
             if self.module_state() == 'locked':
                 raise RuntimeError('Cannot change pixel_settle_time during a running scan frame.')
@@ -317,8 +328,12 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
                 f'windows A={win_a} ns, B={win_b} ns at {self._sample_rate} Hz (pixel {T_ns} ns). '
                 f'Lower pixel_settle_time or the sample rate.')
         ch = self._ps_channels
-        # per-window integration time (s) for the c/s normalization in _windows_to_pixels
-        self._win_time = (float(self._accumulate_fraction) / 2.0) * (L / 1e9)
+        # per-window (A) integration time (s); window B is shorter by 'tail' (the SCAN-001 tail low).
+        # _win_time approximates window A and is used for diff mode (which is known-open, needs RF).
+        # _sum_time is the ACTUAL total count-window duration (win_a + win_b) for exact sum-mode c/s
+        # normalization -- matters if pixel_next_pulse_ns is increased (Codex review).
+        self._win_time = (win_a / 1e9)
+        self._sum_time = (win_a + win_b) / 1e9
 
         def _seg(pairs):
             return [(int(d), int(v)) for (d, v) in pairs if int(d) > 0]  # drop zero-length segments
@@ -531,18 +546,19 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
         # fall back to the settle-free estimate if a frame hasn't been built yet.
         win_time = self._win_time if self._win_time else \
             (float(self._accumulate_fraction) / 2.0) * (1.0 / self._sample_rate)
+        sum_time = self._sum_time if self._sum_time else (2.0 * win_time)  # actual A+B window time
         ab = np.asarray(counts_2n, dtype=np.float64).reshape(-1, 2)  # (pixels, [A, B])
         a, b = ab[:, 0], ab[:, 1]
         if str(self._scan_mode).lower() == 'diff':
-            return (a - b) / win_time                 # VALIDATE: diff normalization
-        return (a + b) / (2.0 * win_time)             # sum -> mean count rate in c/s
+            return (a - b) / win_time                 # VALIDATE: diff normalization (known-open; needs RF)
+        return (a + b) / sum_time                     # sum -> mean count rate in c/s (exact A+B window)
 
     def _available_pixels_total(self):
         """ Pixels whose BOTH count windows have actually closed, read from the Time Tagger itself.
         CountBetweenMarkers.getBinWidths() returns the accumulation time of each window: a closed
         window has width > 0, a not-yet-closed window has width 0 -- independent of photon counts,
         so it works with the laser off (unlike counting nonzero photon counts). 2 windows per pixel.
-        Snaps to the full frame once the NI AO has output every pixel (line physically finished). """
+        The closed-window count is the authority. """
         if self._cbm is None:
             return 0
         try:
@@ -550,11 +566,18 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
         except Exception:
             closed_windows = 0
         completed = closed_windows // 2
-        try:
-            if self._ao_task is not None and self._ao_task.is_task_done():
-                return self._frame_size
-        except Exception:
-            pass
+        # AO-done snap-to-full is only valid when pixel_next is at the pixel END: there the AO's last
+        # sample is clocked at the END of the last pixel, so is_task_done() implies the last pixel's
+        # count windows have closed. With pixel_next_at_start=True (SCAN-007) the last AO sample is
+        # clocked at the START of the last pixel, BEFORE its detect windows close -- snapping there
+        # would return zero/partial data for the final pixel. So only snap in the legacy ordering;
+        # otherwise trust the closed-window count (the frame timeout is the backstop). (Codex review)
+        if not self._pixel_next_at_start:
+            try:
+                if self._ao_task is not None and self._ao_task.is_task_done():
+                    return self._frame_size
+            except Exception:
+                pass
         return max(0, min(completed, self._frame_size))
 
     def _log_scan_timeout(self, timeout):
