@@ -90,6 +90,21 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
     _accumulate_fraction = ConfigOption('accumulate_fraction', default=0.9)
     _scan_mode = ConfigOption('scan_mode', default='sum')
     _pixel_next_pulse_ns = ConfigOption('pixel_next_pulse_ns', default=100)
+    # Per-pixel settle gap (seconds) at the START of each pixel block: the piezo is advanced to this
+    # pixel's position by the previous block's pixel_next pulse, and this gap lets it ARRIVE before
+    # the count windows open, so each pixel's PL is taken at the settled position instead of
+    # mid-transit. Without it, counting during the move biases each pixel toward the previous
+    # position (forward image ~1 px low, backward ~1 px high). Costs count time (shrinks the count
+    # window), so lower the sample_rate if you need it back. HARDWARE-SPECIFIC -- tune to the piezo;
+    # 0 keeps the original behaviour. (SCAN-007)
+    _pixel_settle_time = ConfigOption('pixel_settle_time', default=0.0)
+    # Advance the NI AO at the START of each pixel (trigger -> settle -> count) instead of the end.
+    # The NI AO emits its first sample on the FIRST pixel_next edge, so with the advance at the pixel
+    # END each pixel is counted at the PREVIOUS position p_{i-1} -> a fixed 1-px (2-px fwd/bwd)
+    # registration offset (confirmed rate-independent + pixel-fixed, SCAN-007). Advancing at the start
+    # counts pixel i at p_i. True is the fix; False = legacy (advance at end). Verify with the
+    # forward/backward peak separation -> 0.
+    _pixel_next_at_start = ConfigOption('pixel_next_at_start', default=True)
     _enable_laser = ConfigOption('enable_laser', default=False)
     # idle_laser_on: hold the laser ON while the module is idle (not scanning) — for cursor /
     # positioning tests where you watch the back-reflection. HUMAN-APPROVED continuous laser
@@ -139,6 +154,9 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
         # Samples snapshotted at teardown so get_buffered_samples can still drain them AFTER the
         # frame has stopped (stock ni_x_series_finite_sampling_io contract; see SCAN-003).
         self._unread = None
+        # per-window integration time (s), set when the pixel sequence is built (depends on the
+        # per-pixel settle gap); used for the c/s normalization in _windows_to_pixels (SCAN-007).
+        self._win_time = None
 
     # ---------------------------------------------------------------- lifecycle
     def on_activate(self):
@@ -247,6 +265,15 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
         self._active_in = list(input_channels)
         self._active_out = list(output_channels)
 
+    def set_pixel_settle_time(self, seconds):
+        """ Runtime setter for the per-pixel settle gap (s), so it can be swept from the qudi console
+        without relaunching (SCAN-007 tuning). Takes effect on the NEXT scan; refuses during one. """
+        with self._lock:
+            if self.module_state() == 'locked':
+                raise RuntimeError('Cannot change pixel_settle_time during a running scan frame.')
+            self._pixel_settle_time = float(seconds)
+        self.log.info(f'pixel_settle_time set to {self._pixel_settle_time} s (effective next scan).')
+
     def set_output_mode(self, mode):
         if SamplingOutputMode(mode) != SamplingOutputMode.JUMP_LIST:
             raise ValueError('ConfocalScanIO only supports JUMP_LIST output mode')
@@ -265,31 +292,56 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
 
     # ---------------------------------------------------------------- Pulse Streamer sequence
     def _build_pixel_sequence(self):
-        """ One pixel block (duration T = 1/sample_rate). Streamed n_runs = frame_size times. """
+        """ One pixel block (duration T = 1/sample_rate), streamed n_runs = frame_size times.
+
+        Structure: [settle gap][count region: window A (mw ON) | window B (mw OFF)][pixel_next].
+        The piezo is advanced to THIS pixel's position by the PREVIOUS block's pixel_next pulse (at
+        the block boundary); the settle gap at the START of the block lets the stage arrive there
+        before the count windows open, so each pixel's PL is taken at the settled position rather
+        than mid-transit. Without it, counting during the move biases each pixel toward the previous
+        position (forward image ~1 px low, backward ~1 px high). pixel_settle_time = 0 keeps the
+        original behaviour. (SCAN-007)
+        """
         T_ns = int(round(1e9 / self._sample_rate))
-        half = T_ns // 2
-        skip = int(round((1.0 - float(self._accumulate_fraction)) / 2.0 * T_ns))
         pw = int(min(self._pixel_next_pulse_ns, max(1, T_ns // 100)))
+        settle = int(round(float(self._pixel_settle_time) * 1e9))
+        L = T_ns - pw - settle                       # length of the counting region
+        half = L // 2
+        skip = int(round((1.0 - float(self._accumulate_fraction)) / 2.0 * L))
+        tail = pw
+        win_a = half - skip                          # window A (mw ON) duration
+        win_b = L - half - skip - tail               # window B (mw OFF) duration
+        if win_a <= 0 or win_b <= 0:
+            raise RuntimeError(
+                f'Invalid pixel timing: pixel_settle_time={self._pixel_settle_time} s leaves count '
+                f'windows A={win_a} ns, B={win_b} ns at {self._sample_rate} Hz (pixel {T_ns} ns). '
+                f'Lower pixel_settle_time or the sample rate.')
         ch = self._ps_channels
+        # per-window integration time (s) for the c/s normalization in _windows_to_pixels
+        self._win_time = (float(self._accumulate_fraction) / 2.0) * (L / 1e9)
+
+        def _seg(pairs):
+            return [(int(d), int(v)) for (d, v) in pairs if int(d) > 0]  # drop zero-length segments
 
         seq = self._pulser.createSequence()
-        # mw switch: high first half, low second half
-        seq.setDigital(ch['mw'], [(half, 1), (T_ns - half, 0)])
-        # detect: [skip low][window A high][skip low][window B high][tail low].
-        # The trailing 'tail' low keeps window B's falling edge INSIDE the pixel block, so every
-        # count window closes within its own pixel -- including the last one. Relying on the
-        # inter-block boundary / post-sequence final state left the last window open (off-by-one
-        # timeout: 14999/15000). 'tail' is tiny (~pixel_next pulse width) so the lost integration
-        # time is negligible.
-        tail = pw
-        seq.setDigital(ch['detect'], [(skip, 0), (half - skip, 1),
-                                      (skip, 0), (T_ns - half - skip - tail, 1), (tail, 0)])
-        # pixel_next: advance pulse at the very end of the pixel
-        seq.setDigital(ch['pixel_next'], [(T_ns - pw, 0), (pw, 1)])
+        if self._pixel_next_at_start:
+            # [pixel_next advance][settle][window A (mw ON)][window B (mw OFF)]. Advance the AO to THIS
+            # pixel's position at the very start; the NI AO emits its first sample on the first
+            # pixel_next edge, so advancing first counts pixel i at p_i (fixes the 1-px offset). Then
+            # settle, then count. (SCAN-007)
+            off = pw + settle                            # counting starts after advance + settle
+            seq.setDigital(ch['pixel_next'], _seg([(pw, 1), (T_ns - pw, 0)]))
+            seq.setDigital(ch['mw'], _seg([(off, 0), (half, 1), (L - half, 0)]))
+            seq.setDigital(ch['detect'], _seg([(off + skip, 0), (win_a, 1),
+                                               (skip, 0), (win_b, 1), (tail, 0)]))
+        else:
+            # legacy: [settle][window A][window B][pixel_next]  (advance at the END; 1-px offset)
+            seq.setDigital(ch['pixel_next'], _seg([(T_ns - pw, 0), (pw, 1)]))
+            seq.setDigital(ch['mw'], _seg([(settle, 0), (half, 1), (L - half + pw, 0)]))
+            seq.setDigital(ch['detect'], _seg([(settle + skip, 0), (win_a, 1),
+                                               (skip, 0), (win_b, 1), (tail, 0), (pw, 0)]))
         # laser: held HIGH for the whole pixel if the laser is meant to be ON during the scan
         # (enable_laser) or was already on for positioning (idle_laser_on). Otherwise left LOW.
-        # Without this, the scan sequence would drive the laser channel LOW and turn off a laser
-        # that was on before the scan.
         if self._enable_laser or self._laser_is_on:
             seq.setDigital(ch['laser'], [(T_ns, 1)])
         return seq
@@ -475,8 +527,10 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
 
     # ---------------------------------------------------------------- readout
     def _windows_to_pixels(self, counts_2n):
-        T = 1.0 / self._sample_rate
-        win_time = (float(self._accumulate_fraction) / 2.0) * T  # per-window integration time
+        # per-window integration time: set by _build_pixel_sequence (accounts for the settle gap);
+        # fall back to the settle-free estimate if a frame hasn't been built yet.
+        win_time = self._win_time if self._win_time else \
+            (float(self._accumulate_fraction) / 2.0) * (1.0 / self._sample_rate)
         ab = np.asarray(counts_2n, dtype=np.float64).reshape(-1, 2)  # (pixels, [A, B])
         a, b = ab[:, 0], ab[:, 1]
         if str(self._scan_mode).lower() == 'diff':
