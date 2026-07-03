@@ -407,11 +407,18 @@ class OdmrScanInput(FiniteSamplingInputInterface):
                     time.sleep(float(self._cbm_arm_delay))
 
                 # Pulse Streamer: play the point block n times (advances the SMIQ + gates the TT).
-                # IMMEDIATE start so it runs as soon as streamed (the TT is already armed above);
-                # final=ZERO so the detect line drops LOW after the last point -> the last count
-                # window's closing edge occurs and CountBetweenMarkers completes.
+                # IMMEDIATE start so it runs as soon as streamed (the TT is already armed above).
+                # Each point's detect pattern ends with a 'tail' LOW, so the last count window's closing
+                # edge occurs WITHIN the sequence (SCAN-001); the stream 'final' state is just the idle
+                # output held AFTER the sequence. Hold the LASER HIGH as that final state when
+                # keep_laser_on, so there is NO laser-off gap at the end of each sweep line (steady
+                # illumination between lines -> no re-bleaching transient). The final state raises ONLY
+                # the laser channel (detect/mw/advance stay LOW), so window closure is unaffected.
+                # Otherwise all outputs LOW.
+                final_state = ps.OutputState([int(self._ps_channels['laser'])], 0, 0) \
+                    if (self._keep_laser_on and self._enable_laser) else ps.OutputState.ZERO()
                 self._pulser.setTrigger(start=ps.TriggerStart.IMMEDIATE)
-                self._pulser.stream(self._build_point_sequence(), n, ps.OutputState.ZERO())
+                self._pulser.stream(self._build_point_sequence(), n, final_state)
                 self._frame_start_time = time.perf_counter()
             except Exception:
                 self._teardown()
