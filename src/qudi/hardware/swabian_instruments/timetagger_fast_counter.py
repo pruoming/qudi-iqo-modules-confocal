@@ -25,6 +25,7 @@ import TimeTagger as tt
 
 from qudi.interface.fast_counter_interface import FastCounterInterface
 from qudi.core.configoption import ConfigOption
+from qudi.core.connector import Connector
 
 
 class TimeTaggerFastCounter(FastCounterInterface):
@@ -48,12 +49,43 @@ class TimeTaggerFastCounter(FastCounterInterface):
     _channel_detect = ConfigOption('timetagger_channel_detect', missing='error')
     _channel_sequence = ConfigOption('timetagger_channel_sequence', missing='error')
     _sum_channels = ConfigOption('timetagger_sum_channels', True, missing='warn')
+    # Optional: pin a specific Time Tagger serial when this module OPENS ITS OWN connection
+    # (standalone pulsed config). Ignored when a tagger_provider is connected.
+    _tt_serial = ConfigOption('timetagger_serial', default='')
+
+    # PROJECT CONVENTION (shared_knowledge/qudi_notes.md): the Time Tagger is a SHARED device owned by
+    # a dedicated timetagger_provider module; borrow it via this optional connector so only ONE
+    # createTimeTagger() connection exists. If not connected (standalone use), this module opens its own.
+    _tagger_provider = Connector(name='tagger_provider', interface='TimeTaggerProvider', optional=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tagger = None
+        self._owns_tagger = False
+        self.pulsed = None
 
     def on_activate(self):
         """ Connect and configure the access to the FPGA.
         """
-        self._tagger = tt.createTimeTagger()
-        self._tagger.reset()
+        # Borrow the shared Time Tagger from a provider if connected, else open our own. When BORROWING
+        # we must NOT call tagger.reset() — that would wipe the shared device's state (other measurements
+        # running on the same handle). Only reset a Tagger we own.
+        provider = None
+        try:
+            provider = self._tagger_provider()
+        except Exception:
+            provider = None
+        if provider is not None:
+            self._tagger = provider.get_tagger()
+            self._owns_tagger = False
+            self.log.info(f'Using shared Time Tagger from tagger_provider, serial '
+                          f'{self._tagger.getSerial()}.')
+        else:
+            self._tagger = tt.createTimeTagger(self._tt_serial) if self._tt_serial \
+                else tt.createTimeTagger()
+            self._tagger.reset()
+            self._owns_tagger = True
+            self.log.info(f'Connected own Time Tagger, serial {self._tagger.getSerial()}.')
 
         self._number_of_gates = int(100)
         self._bin_width = 1
@@ -119,10 +151,20 @@ class TimeTaggerFastCounter(FastCounterInterface):
     def on_deactivate(self):
         """ Deactivate the FPGA.
         """
-        if self.module_state() == 'locked':
-            self.pulsed.stop()
-        self.pulsed.clear()
-        self.pulsed = None
+        # Tear down our own TimeDifferences measurement (guard: configure() may never have run, so
+        # self.pulsed can be None).
+        if self.pulsed is not None:
+            if self.module_state() == 'locked':
+                self.pulsed.stop()
+            self.pulsed.clear()
+            self.pulsed = None
+        # Free the device only if we opened it ourselves; a borrowed Tagger is owned by the provider.
+        if self._owns_tagger and self._tagger is not None:
+            try:
+                tt.freeTimeTagger(self._tagger)
+            except Exception:
+                pass
+        self._tagger = None
 
     def configure(self, bin_width_s, record_length_s, number_of_gates=0):
 

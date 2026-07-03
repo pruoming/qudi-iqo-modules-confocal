@@ -25,6 +25,7 @@ import pulsestreamer as ps
 
 from qudi.core.configoption import ConfigOption
 from qudi.core.statusvariable import StatusVar
+from qudi.core.connector import Connector
 from qudi.interface.pulser_interface import PulserInterface, PulserConstraints
 
 
@@ -51,6 +52,11 @@ class PulseStreamer(PulserInterface):
     _external_clock_option = ConfigOption('external_clock_option', 0, missing='info')
     # 0: Internal (default), 1: External 125 MHz, 2: External 10 MHz
 
+    # PROJECT CONVENTION (shared_knowledge/qudi_notes.md): the Pulse Streamer is a SHARED device owned by
+    # a dedicated pulsestreamer_provider module; borrow it via this optional connector so only ONE
+    # connection exists. If not connected (standalone use), this module opens its own (pulsestreamer_ip).
+    _ps_provider = Connector(name='ps_provider', interface='PulseStreamerProvider', optional=True)
+
     __current_waveform = StatusVar(name='current_waveform', default={})
     __current_waveform_name = StatusVar(name='current_waveform_name', default='')
     __sample_rate = StatusVar(name='sample_rate', default=1e9)
@@ -63,26 +69,47 @@ class PulseStreamer(PulserInterface):
         self.__samples_written = 0
         self._trigger = ps.TriggerStart.SOFTWARE
         self._laser_mw_on_state = ps.OutputState([self._laser_channel, self._uw_x_channel], 0, 0)
+        self.pulse_streamer = None
+        self._owns_pulser = False
 
     def on_activate(self):
         """ Establish connection to pulse streamer and tell it to cancel all operations """
-        self.pulse_streamer = ps.PulseStreamer(self._pulsestreamer_ip)
-        if self._use_external_clock:
-            if int(self._external_clock_option) == 2:
-                self.pulse_streamer.selectClock(ps.ClockSource.EXT_10MHZ)
-            elif int(self._external_clock_option) == 1:
-                self.pulse_streamer.selectClock(ps.ClockSource.EXT_125MHZ)
-            elif int(self._external_clock_option) == 0:
-                self.pulse_streamer.selectClock(ps.ClockSource.INTERNAL)
-            else:
-                self.log.error('pulsestreamer external clock selection not allowed')
+        # Borrow the shared Pulse Streamer from a provider if connected, else open our own. When
+        # BORROWING, do NOT select the clock or force any output state here — the provider owns the
+        # device's startup/idle state (it sets all outputs LOW on its own activation, before any
+        # borrower). We only drive the shared PS while actively streaming a pulse sequence.
+        ps_owner = None
+        try:
+            ps_owner = self._ps_provider()
+        except Exception:
+            ps_owner = None
+        if ps_owner is not None:
+            self.pulse_streamer = ps_owner.get_pulser()
+            self._owns_pulser = False
+            self.log.info('Using shared Pulse Streamer from the ps_provider module.')
+        else:
+            self.pulse_streamer = ps.PulseStreamer(self._pulsestreamer_ip)
+            self._owns_pulser = True
+            if self._use_external_clock:
+                if int(self._external_clock_option) == 2:
+                    self.pulse_streamer.selectClock(ps.ClockSource.EXT_10MHZ)
+                elif int(self._external_clock_option) == 1:
+                    self.pulse_streamer.selectClock(ps.ClockSource.EXT_125MHZ)
+                elif int(self._external_clock_option) == 0:
+                    self.pulse_streamer.selectClock(ps.ClockSource.INTERNAL)
+                else:
+                    self.log.error('pulsestreamer external clock selection not allowed')
         self.__samples_written = 0
         self.__currently_loaded_waveform = ''
         self.current_status = 0
 
     def on_deactivate(self):
-        self.reset()
-        del self.pulse_streamer
+        # Only reset (zeroes all outputs) + drop the handle if we OWN the device. A borrowed shared
+        # Pulse Streamer is managed by its provider/owner — resetting it here would zero outputs another
+        # module may be relying on and steal the provider's idle-state ownership.
+        if self._owns_pulser and self.pulse_streamer is not None:
+            self.reset()
+        self.pulse_streamer = None
 
     def get_constraints(self):
         """
