@@ -63,7 +63,6 @@ class OdmrCwControlDockWidget(AdvancedDockWidget):
         self.cw_power_spinbox.setMinimumWidth(self._min_spinbox_width)
         self.cw_power_spinbox.setDecimals(6)
         self.cw_power_spinbox.setSuffix('dBm')
-        self.cw_power_spinbox.valueChanged.connect(self._cw_parameters_changed_cb)
         if power_range is not None:
             self.cw_power_spinbox.setRange(*power_range)
         main_layout.addWidget(self.cw_power_spinbox)
@@ -74,12 +73,22 @@ class OdmrCwControlDockWidget(AdvancedDockWidget):
         self.cw_frequency_spinbox.setMinimumWidth(self._min_spinbox_width)
         self.cw_frequency_spinbox.setDecimals(6)
         self.cw_frequency_spinbox.setSuffix('Hz')
-        self.cw_frequency_spinbox.valueChanged.connect(self._cw_parameters_changed_cb)
         if frequency_range is None:
             self.cw_frequency_spinbox.setMinimum(0)
         else:
             self.cw_frequency_spinbox.setRange(*frequency_range)
         main_layout.addWidget(self.cw_frequency_spinbox)
+
+        # Connect the change callbacks ONLY AFTER both spinboxes exist and their ranges are set.
+        # setRange() can clamp the current value and emit valueChanged when that value is outside the
+        # new range -- e.g. the default 0 dBm falls outside a power range whose max is below 0, as
+        # happens with a low SMIQ power_max cap (here -7 dBm -> range (-144, -7)). If the callback is
+        # connected before cw_frequency_spinbox exists (as upstream did for cw_power_spinbox), that
+        # init-time emission calls cw_parameters -> reads cw_frequency_spinbox before it is created ->
+        # AttributeError on launch (GUI-002). Connecting here also avoids a spurious
+        # parameters-changed signal during construction. (Fork fix; candidate to upstream.)
+        self.cw_power_spinbox.valueChanged.connect(self._cw_parameters_changed_cb)
+        self.cw_frequency_spinbox.valueChanged.connect(self._cw_parameters_changed_cb)
 
     @property
     def cw_parameters(self):

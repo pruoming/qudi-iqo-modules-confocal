@@ -130,7 +130,13 @@ class MicrowaveSmiq(MicrowaveInterface):
             power_limits=power_limits,
             frequency_limits=freq_limits,
             scan_size_limits=(2, 4000),
-            sample_rate_limits=(0.1, 100),  # FIXME: Look up the proper specs for sample rate
+            sample_rate_limits=(0.1, 200),  # scan step-rate cap. Was (0.1, 100) upstream (a placeholder
+                                            # FIXME, not a real spec); raised to 200 Hz, operator-confirmed
+                                            # 2026-07-02 (200 Hz = 5 ms/point is acceptable for this SMIQ).
+                                            # NOTE: in EXT-triggered list mode the SMIQ steps on PS-ch6
+                                            # edges, so the REAL limiter is its frequency SETTLE time,
+                                            # enforced per point by odmr_scan_input.mw_settle_time — not
+                                            # by this coarse cap. (ODMR-001)
             scan_modes=(SamplingOutputMode.JUMP_LIST, SamplingOutputMode.EQUIDISTANT_SWEEP)
         )
 

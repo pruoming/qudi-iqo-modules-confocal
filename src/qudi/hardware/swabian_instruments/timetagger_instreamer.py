@@ -64,10 +64,10 @@ class TimeTaggerInstreamer(DataInStreamInterface):
                               constructor=lambda t: np.dtype(t).type)
     # VALIDATE: Time Tagger 20 max meaningful bin rate — placeholder cap, confirm vs specs.
     _max_sample_rate = ConfigOption(name='max_sample_rate', default=1.0e6)
-    # Optional: borrow the Time Tagger object from another module that already owns the device
-    # (e.g. confocal_scan_io), so the counter and the confocal scan share ONE Time Tagger
-    # connection. If not connected, this module opens its own (standalone counter use).
-    _tagger_provider = Connector(name='tagger_provider', interface='FiniteSamplingIOInterface',
+    # Optional: borrow the Time Tagger object from the dedicated owner module (timetagger_provider),
+    # so the live counter and the confocal scan / ODMR sweep all share ONE Time Tagger connection.
+    # If not connected, this module opens its own (standalone counter use).
+    _tagger_provider = Connector(name='tagger_provider', interface='TimeTaggerProvider',
                                  optional=True)
 
     def __init__(self, *args, **kwargs):

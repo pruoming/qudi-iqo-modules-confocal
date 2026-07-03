@@ -41,6 +41,7 @@ import pulsestreamer as ps
 import TimeTagger as tt
 
 from qudi.core.configoption import ConfigOption
+from qudi.core.connector import Connector
 from qudi.util.mutex import Mutex
 from qudi.util.constraints import ScalarConstraint
 from qudi.interface.finite_sampling_io_interface import (FiniteSamplingIOInterface,
@@ -81,7 +82,8 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
     _ao_channels = ConfigOption('ao_channels', missing='error')
     _ao_voltage_limits = ConfigOption('ao_voltage_limits', default=(0.0, 10.0))
     _ni_clk_terminal = ConfigOption('ni_sample_clock_terminal', default='/Dev1/PFI0')
-    _ps_ip = ConfigOption('pulsestreamer_ip', missing='error')
+    # Required only when this module opens its OWN Pulse Streamer (no ps_provider connected).
+    _ps_ip = ConfigOption('pulsestreamer_ip', default=None)
     _ps_channels = ConfigOption('ps_channels', missing='error')
     _tt_serial = ConfigOption('timetagger_serial', default='')
     _apd_channels = ConfigOption('apd_channels', missing='error')
@@ -130,11 +132,20 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
     # of tagger.sync(); >=0.05 s was proven sufficient at 1 kHz (probe_scan_registration.py).
     _cbm_arm_delay = ConfigOption('cbm_arm_delay', default=0.05)
 
+    # OPTIONAL shared-device owners. If connected, this module BORROWS the Time Tagger / Pulse Streamer
+    # from a dedicated provider (timetagger_provider / pulsestreamer_provider) so several modules share
+    # ONE connection each. If NOT connected, this module opens its own (existing standalone confocal
+    # configs are unaffected). get_tagger()/get_pulser() work either way (they relay the shared handle).
+    _tagger_provider = Connector(name='tagger_provider', interface='TimeTaggerProvider', optional=True)
+    _ps_provider = Connector(name='ps_provider', interface='PulseStreamerProvider', optional=True)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._lock = Mutex()
         self._tagger = None
+        self._owns_tagger = False
         self._pulser = None
+        self._owns_pulser = False
         self._constraints = None
         # active scan/frame state
         self._sample_rate = 0.0
@@ -178,17 +189,59 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             _val = getattr(self, _name)
             if _val is not None and float(_val) < 0:
                 raise ValueError(f'{_name[1:]} must be >= 0, got {_val}')
-        self._pulser = ps.PulseStreamer(self._ps_ip)
-        self._tagger = tt.createTimeTagger(self._tt_serial) if self._tt_serial else tt.createTimeTagger()
-        # Set a defined output state at activation.
-        if self._idle_laser_on:
-            self._pulser.constant(ps.OutputState([int(self._ps_channels['laser'])], 0, 0))
-            self._laser_is_on = True
-            self.log.warning('LASER ON at activation (idle_laser_on=True): human-approved continuous '
-                             'laser output for a positioning test; Pulse Streamer laser channel HIGH.')
+        # Borrow the Pulse Streamer / Time Tagger from a dedicated provider module if one is connected
+        # (shared-device config); otherwise open our own (standalone confocal config). We remember
+        # which we own so on_deactivate only frees/zeros a device we opened.
+        ps_owner = None
+        try:
+            ps_owner = self._ps_provider()
+        except Exception:
+            ps_owner = None
+        if ps_owner is not None:
+            self._pulser = ps_owner.get_pulser()
+            self._owns_pulser = False
         else:
-            self._pulser.constant(ps.OutputState.ZERO())  # all outputs LOW (laser/mw OFF)
+            if not self._ps_ip:
+                raise ValueError('pulsestreamer_ip is required when no ps_provider connector is set')
+            self._pulser = ps.PulseStreamer(self._ps_ip)
+            self._owns_pulser = True
+
+        tt_owner = None
+        try:
+            tt_owner = self._tagger_provider()
+        except Exception:
+            tt_owner = None
+        if tt_owner is not None:
+            self._tagger = tt_owner.get_tagger()
+            self._owns_tagger = False
+        else:
+            self._tagger = tt.createTimeTagger(self._tt_serial) if self._tt_serial \
+                else tt.createTimeTagger()
+            self._owns_tagger = True
+
+        # Defined output state at activation -- only ASSERT it when we OWN the Pulse Streamer. When the
+        # PS is BORROWED from a ps_provider, that provider owns the startup idle state (it sets all
+        # outputs LOW on its own activation, which happens before any borrower) and other modules may
+        # share the same PS, so we must NOT stomp it here. This module then drives the shared PS only
+        # while actually scanning and returns it to a safe state on stop/_teardown -- mirroring
+        # on_deactivate, which is already deferential to a borrowed PS. (Coordination flag from the
+        # confocal-side review, 2026-07-03: chose to gate activate to owned-PS-only.)
+        if self._owns_pulser:
+            if self._idle_laser_on:
+                self._pulser.constant(ps.OutputState([int(self._ps_channels['laser'])], 0, 0))
+                self._laser_is_on = True
+                self.log.warning('LASER ON at activation (idle_laser_on=True): human-approved '
+                                 'continuous laser output for a positioning test; PS laser channel HIGH.')
+            else:
+                self._pulser.constant(ps.OutputState.ZERO())  # all outputs LOW (laser/mw OFF)
+                self._laser_is_on = False
+        else:
+            # Borrowed PS: leave the idle state to its provider (already all-LOW). Do not assert here.
             self._laser_is_on = False
+            if self._idle_laser_on:
+                self.log.warning('idle_laser_on is IGNORED on a BORROWED Pulse Streamer (the '
+                                 'ps_provider owns the idle state). Use laser_on() to drive the shared '
+                                 'laser deliberately.')
 
         lo, hi = float(self._ao_voltage_limits[0]), float(self._ao_voltage_limits[1])
         out_units = {ax: 'V' for ax in self._ao_channels}
@@ -212,14 +265,20 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             self.stop_buffered_frame()
         except Exception:
             pass
-        if self._pulser is not None:
+        # Force outputs LOW only if we OWN the Pulse Streamer; a borrowed one is managed by its
+        # provider (stop_buffered_frame above already returned a running scan's outputs to LOW).
+        if self._owns_pulser and self._pulser is not None:
             try:
                 self._pulser.constant(ps.OutputState.ZERO())  # leave all outputs LOW (safe)
             except Exception:
                 pass
-        if self._tagger is not None:
-            tt.freeTimeTagger(self._tagger)
-            self._tagger = None
+        # Only free the Time Tagger if we opened it ourselves (a borrowed one is owned by its provider).
+        if self._owns_tagger and self._tagger is not None:
+            try:
+                tt.freeTimeTagger(self._tagger)
+            except Exception:
+                pass
+        self._tagger = None
         self._pulser = None
 
     # ---------------------------------------------------------------- properties
@@ -539,6 +598,14 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
         concurrent measurements on one connection, whereas a second createTimeTagger() for the same
         device would fail. """
         return self._tagger
+
+    def get_pulser(self):
+        """ Return the underlying Pulse Streamer client so another module (e.g. odmr_scan_input) can
+        drive the SAME Pulse Streamer instead of opening a second connection to it. Only one
+        measurement drives the Pulse Streamer at a time (confocal scan OR ODMR sweep), and every path
+        returns it to a safe state, so sharing one client is safe; two independent connections to the
+        same device are avoided. """
+        return self._pulser
 
     # ---------------------------------------------------------------- readout
     def _windows_to_pixels(self, counts_2n):
