@@ -52,6 +52,12 @@ class TimeTaggerFastCounter(FastCounterInterface):
     # Optional: pin a specific Time Tagger serial when this module OPENS ITS OWN connection
     # (standalone pulsed config). Ignored when a tagger_provider is connected.
     _tt_serial = ConfigOption('timetagger_serial', default='')
+    # Selectable fast-counter bin widths (seconds) offered in the Pulsed GUI dropdown. The Time Tagger
+    # histograms at arbitrary integer-picosecond bins, so any multiple of its base resolution is valid;
+    # this list just populates the GUI. Default spans 1 ns .. 100 ns. Override in the config to taste.
+    _binwidth_list = ConfigOption('hardware_binwidth_list',
+                                  default=[1e-9, 2e-9, 4e-9, 5e-9, 8e-9,
+                                           1e-8, 2e-8, 5e-8, 1e-7])
 
     # PROJECT CONVENTION (shared_knowledge/qudi_notes.md): the Time Tagger is a SHARED device owned by
     # a dedicated timetagger_provider module; borrow it via this optional connector so only ONE
@@ -139,8 +145,10 @@ class TimeTaggerFastCounter(FastCounterInterface):
         constraints = dict()
 
         # the unit of those entries are seconds per bin. In order to get the
-        # current binwidth in seonds use the get_binwidth method.
-        constraints['hardware_binwidth_list'] = [1 / 1000e6]
+        # current binwidth in seonds use the get_binwidth method. Configurable via the
+        # 'hardware_binwidth_list' ConfigOption (default 1 ns .. 100 ns); sorted ascending so the GUI
+        # dropdown lists them in order and the first entry is the finest.
+        constraints['hardware_binwidth_list'] = sorted(float(b) for b in self._binwidth_list)
 
         # TODO: think maybe about a software_binwidth_list, which will
         #      postprocess the obtained counts. These bins must be integer
@@ -187,12 +195,21 @@ class TimeTaggerFastCounter(FastCounterInterface):
         self._record_length = 1 + int(record_length_s / bin_width_s)
         self.statusvar = 1
 
+        # start_channel = next_channel = the detect readout gate (this setup: PS ch1 -> TT ch5): each
+        # detect edge restarts the per-gate bin timing (t=0) and advances to the next histogram row.
+        # sync_channel = the sequence/sync reset marker (this setup: PS ch7 -> TT ch8): it resets the
+        # histogram ROW index to 0 once per sequence repetition, so a stray/delayed detect edge can't
+        # walk the running histogram out of alignment (per connections.yaml + measurement_techniques.md).
+        # Wiring _channel_sequence here (instead of the stock CHANNEL_UNUSED) makes that config option,
+        # previously declared-but-unused, actually drive the histogram reset. Set timetagger_channel_
+        # sequence to a channel that receives NO edges (or leave the sync wire unpopulated) to recover
+        # the stock 'no reset' behaviour.
         self.pulsed = tt.TimeDifferences(
             tagger=self._tagger,
             click_channel=self._channel_apd,
             start_channel=self._channel_detect,
             next_channel=self._channel_detect,
-            sync_channel=tt.CHANNEL_UNUSED,
+            sync_channel=self._channel_sequence,
             binwidth=int(np.round(self._bin_width * 1000)),
             n_bins=int(self._record_length),
             n_histograms=number_of_gates)
