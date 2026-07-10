@@ -348,6 +348,24 @@ class ScanningOptimizeLogic(LogicBase):
                         )
 
                     position_update = {ax: opt_pos[ii] for ii, ax in enumerate(data.settings.axes)}
+                    # Clamp the fit result to the scanned range (fork edit 2026-07-10, operator
+                    # request): a Gaussian fit on a peak that is NOT contained in the optimizer
+                    # window can extrapolate a center outside the scanned range; never move the
+                    # scanner to a position the optimizer did not scan. Clamp to the window edge
+                    # and warn — the warning tells the user to recenter or widen the range.
+                    for ii, ax in enumerate(data.settings.axes):
+                        rng_min = min(data.settings.range[ii])
+                        rng_max = max(data.settings.range[ii])
+                        if not rng_min <= position_update[ax] <= rng_max:
+                            clamped = min(max(position_update[ax], rng_min), rng_max)
+                            self.log.warning(
+                                f'Optimizer fit center for axis "{ax}" '
+                                f'({position_update[ax]:.6e}) lies outside the scanned range '
+                                f'[{rng_min:.6e}, {rng_max:.6e}] — clamped to {clamped:.6e}. '
+                                f'The real peak is probably outside the optimizer window: '
+                                f'recenter on the clamped position and optimize again, or '
+                                f'widen the optimizer range in the settings.')
+                            position_update[ax] = clamped
                     # self.log.debug(f"Optimizer issuing position update: {position_update}")
                     if fit_data is not None:
                         new_pos = self._scan_logic().set_target_position(position_update, move_blocking=True)
