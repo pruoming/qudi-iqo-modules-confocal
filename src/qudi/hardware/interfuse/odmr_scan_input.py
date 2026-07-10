@@ -1,210 +1,227 @@
 # -*- coding: utf-8 -*-
 
 """
-Qudi hardware module (confocal_odmr): FiniteSamplingInput that produces one CW-ODMR sweep line —
-fluorescence vs microwave frequency — by coordinating the Pulse Streamer (master clock) and the
-Time Tagger, while the SMIQ steps its frequency list on an EXTERNAL trigger.
+OdmrScanInput — custom FiniteSamplingInputInterface hardware module for the confocal_odmr
+setup (the `data_scanner` of the stock OdmrLogic).
 
-It implements FiniteSamplingInputInterface so the stock qudi ODMR stack (OdmrGui + OdmrLogic) can be
-reused UNCHANGED. OdmrLogic connects:
-    microwave     -> mw_source_smiq   (MicrowaveInterface, already validated; RF gated by the cap)
-    data_scanner  -> THIS module      (FiniteSamplingInputInterface)
-Per sweep line OdmrLogic does:  configure_scan(power, frequencies, JUMP_LIST, sample_rate) +
-start_scan()  (arms the SMIQ list, output ON, EXT-triggered, parked at the first entry), then calls
-data_scanner.acquire_frame()  (this module: N frequency points), then microwave.reset_scan().
+One ODMR sweep line = one hardware-timed frame of N frequency points, coordinated across
+three devices (wiring: Qudi_AI/setups/confocal_odmr/connections.yaml):
 
-This is the CW-ODMR analogue of hardware/interfuse/confocal_scan_io.py, but SIMPLER:
-  * it sweeps FREQUENCY, not position: there is NO NI AO / PFI0 external clock at all;
-  * the per-point "advance" pulse goes to the SMIQ frequency-advance trigger (Pulse Streamer ch6 =
-    'next', connections.yaml) instead of the NI-AO pixel clock;
-  * ONE count window per point (mw is continuously ON in CW-ODMR), not the 2 mw-on/mw-off windows
-    of the confocal diff scan.
-Reused verbatim from the confocal bring-up (see Qudi_AI/setups/confocal_odmr/known_issues.yaml):
-  * SCAN-006 ARM BARRIER: tagger.sync() + a short cbm_arm_delay BEFORE starting the Pulse Streamer,
-    because a freshly created CountBetweenMarkers is not armed instantly (early 'detect' edges lost).
-  * SCAN-002 progressive readout via CountBetweenMarkers.getBinWidths() (closed-window count works
-    with the laser off, unlike counting nonzero photons).
-  * SCAN-001 self-contained window: the detect pattern ends each point with a low 'tail' so every
-    count window's closing edge falls inside its own point (else the last window never closes).
-  * SCAN-007-style edge alignment: whether the SMIQ advance fires at the point START or END changes
-    which frequency each window is measured at. Default advance_at_start=True (advance -> settle ->
-    count). VERIFY EMPIRICALLY with a Phase-3 probe (RF off) that point i is measured at frequency i
-    — the SMIQ list is written with its first entry DUPLICATED (mw_source_smiq._write_list), an
-    external-trigger workaround that shifts the trigger/point correspondence.
+  - Rohde & Schwarz SMIQ06B: EXT-triggered frequency LIST (:LIST:MODE STEP). The stock
+    mw_source_smiq configure_scan() writes the list (first entry DUPLICATED as a trigger
+    workaround), start_scan() turns RF on and parks at the first entry, and the SMIQ then
+    advances ONE frequency per rising edge on Pulse Streamer ch6 ('next'). This module
+    couples to the SMIQ PHYSICALLY only (the ch6 wire) — no SMIQ connector.
+  - Pulse Streamer 8/2 (master clock): streams the per-point sequence — next advance pulse
+    (ch6 -> SMIQ), detect count-gate edge pair (ch1 -> TT ch5), mw switch level (ch4),
+    laser gate level (ch0).
+  - Time Tagger 20: CountBetweenMarkers on the (combined) APD channels, gated by the detect
+    marker (begin = rising TT ch5, end = falling TT ch5 = -ch5).
 
-Shared Time Tagger: like confocal_scan_io this module can OWN the Time Tagger (createTimeTagger) and
-expose get_tagger() so a live counter (timetagger_instreamer) can borrow it; OR it can itself borrow
-one from another owner via the optional tagger_provider connector. One connection, many measurements.
+Per-point sequence (advance_at_start=True, default):
 
-SAFETY / STATUS: FIRST DRAFT, CW-ODMR. This module gates the laser (ch0) and the mw switch (ch4) via
-the Pulse Streamer, and pulses the SMIQ frequency-advance trigger (ch6). It does NOT set RF power or
-enable the SMIQ RF output — OdmrLogic/mw_source_smiq own that, gated by the human-confirmed power cap
-(Phase 0, still to_be_confirmed). Validate MOCK first (finite_sampling_input_dummy), then RF-OFF
-(sweep + counting mechanics), then RF-ON only with the approved cap. Lines marked `# VALIDATE` need a
-hardware check. Measurement correctness needs expert validation. Codex review advised.
+    sum  mode: [next pulse][mw_settle_time][skip][ count window ][skip]
+               mw switch held OPEN for the whole point iff cw_mw_on (CW ODMR); 1 window/point.
+    diff mode: [next pulse][mw_settle_time][skip][win A][2*skip][win B][skip]
+               mw switch OPEN over the first (A) half only; 2 windows/point.
+               Readout = rate(A) - rate(B): the slow PL bleaching baseline common to both
+               windows cancels, leaving a flat ~0 baseline + the resonance dip.
+               NOTE: diff values are NEGATIVE-capable by design.
+
+mw_settle_time is the dwell after the SMIQ frequency advance before counting — the REAL rate
+limiter (ODMR-001: the SMIQ settle takes ~ms; raise this / lower the data rate if the dip
+position depends on sweep direction). accumulate_fraction sets the count-window fill of the
+counting region; the trailing low 'skip' guarantees every detect window closes INSIDE its own
+point block (SCAN-001 lesson), independent of the Pulse Streamer final state.
+
+The point<->frequency mapping under advance_at_start with the SMIQ's duplicated first list
+entry (point i measured at frequency i) is an assumption to VERIFY empirically with RF off
+(rebuild_runbook.md step 28) — as in cycle 1.
+
+Shared-device convention (qudi_notes): Time Tagger / Pulse Streamer are borrowed from their
+provider modules when the optional connectors are wired; otherwise this module opens (and
+then owns) its own connection. It only asserts device output/idle states on devices it OWNS.
+
+Laser (SAFE-003, operator-approved): enable_laser drives the laser gate (ch0) HIGH during
+the sweep. keep_laser_on additionally holds the laser HIGH between sweep lines AND after the
+scan (Pulse Streamer FINAL state + teardown state = laser-high, not ZERO) so the PL source
+sees STEADY illumination — a blink between lines re-triggers the bleaching transient
+(cycle-1 lesson, progress 2026-07-02/03). A manual laser_on() is likewise preserved across
+frames and restored at teardown. Call laser_off() to stop the light.
+
+SAFETY: activation performs NO RF and NO motion; RF power is capped upstream (SAFE-001,
+power_max -7 dBm in the SMIQ config) and RF-ON is a human action (amp PSU). If this module
+owns the Pulse Streamer it sets all outputs LOW on activation.
+
+Example config (see Qudi_AI/setups/confocal_odmr/qudi_config_confocal_odmr.cfg):
+
+    odmr_scan_input:
+        module.Class: 'interfuse.odmr_scan_input.OdmrScanInput'
+        connect:
+            tagger_provider: timetagger_provider   # optional — borrow the shared Time Tagger
+            ps_provider: pulsestreamer_provider    # optional — borrow the shared Pulse Streamer
+        options:
+            # pulsestreamer_ip: '169.254.8.2'      # only used when ps_provider is NOT connected
+            ps_channels:
+                laser: 0        # PS ch0 -> laser diode gate
+                mw: 4           # PS ch4 -> mw switch TTL
+                detect: 1       # PS ch1 -> Time Tagger ch5 (count-gate marker)
+                next: 6         # PS ch6 -> SMIQ frequency-advance trigger (rising edge)
+            apd_channels: [1, 2]
+            detect_tt_channel: 5
+            input_channel_name: 'fluorescence'
+            mw_settle_time: 1.0e-3
+            accumulate_fraction: 0.9
+            next_pulse_ns: 100
+            advance_at_start: True
+            cw_mw_on: True
+            scan_mode: 'diff'         # 'sum' for RF-off mechanics; 'diff' for the RF-on dip
+            enable_laser: True        # SAFE-003
+            keep_laser_on: True
+            cbm_arm_delay: 0.05
+            default_sample_rate: 200.0
+
+Cycle-2 note: this file is the BLIND REBUILD of the cycle-1 module (rebuild_runbook.md step
+26b; seal rules Phase 4). Sources: progress.md 2026-07-02/03 ODMR entries, known_issues
+(GUI-002, ODMR-001, SCAN-001/002/003/006 lessons), connections.yaml, qudi_notes.md,
+measurement_techniques.md, qudi_config_confocal_odmr.cfg, stock qudi code, and the freshly
+rebuilt confocal_scan_io.py as the pattern donor. The cycle-1 file was never read.
 
 This file is part of qudi. Licensed under LGPL v3.
 """
 
 import time
-import numpy as np
 
-import pulsestreamer as ps
+import numpy as np
+import pulsestreamer as pstr
 import TimeTagger as tt
 
 from qudi.core.configoption import ConfigOption
 from qudi.core.connector import Connector
-from qudi.util.mutex import Mutex
-from qudi.interface.finite_sampling_input_interface import (FiniteSamplingInputInterface,
-                                                            FiniteSamplingInputConstraints)
+from qudi.interface.finite_sampling_input_interface import FiniteSamplingInputInterface, \
+    FiniteSamplingInputConstraints
+from qudi.util.mutex import RecursiveMutex
 
 
 class OdmrScanInput(FiniteSamplingInputInterface):
+    """ FiniteSamplingInput producing one CW-ODMR sweep line per frame by coordinating the
+    Pulse Streamer per-point sequence (SMIQ advance + mw gate + laser + detect marker) with
+    Time Tagger gated counting.
     """
-    Example config:
 
-    odmr_scan_input:
-        module.Class: 'interfuse.odmr_scan_input.OdmrScanInput'
-        options:
-            pulsestreamer_ip: '169.254.8.2'
-            ps_channels:                 # Pulse Streamer digital channels (connections.yaml)
-                laser: 0
-                mw: 4                    # mw switch gate (ZASWA-2-50DR+)
-                detect: 1                # count-gate marker -> Time Tagger ch5
-                next: 6                  # SMIQ frequency-advance trigger (rising edge)
-            timetagger_serial: ''        # optional; '' -> the only Time Tagger
-            apd_channels: [1, 2]         # Time Tagger click channels (APD1, APD2)
-            detect_tt_channel: 5         # Time Tagger channel receiving the 'detect' marker
-            input_channel_name: 'fluorescence'
-            mw_settle_time: 1.0e-3       # s, dwell AFTER the SMIQ advance before counting.
-                                         # to_be_confirmed vs the SMIQ settle spec (~few ms). TUNE.
-            accumulate_fraction: 0.9     # fraction of the post-settle window actually counted
-            next_pulse_ns: 100           # width of the SMIQ-advance pulse (ch6)
-            advance_at_start: True        # advance at point START (advance->settle->count); SCAN-007
-            cw_mw_on: True               # hold the mw switch (ch4) OPEN for the whole line (CW-ODMR)
-            enable_laser: False          # True drives ch0 laser HIGH during the line -- HUMAN APPROVAL
-            cbm_arm_delay: 0.05          # SCAN-006 arm barrier (s) before starting the Pulse Streamer
-            default_sample_rate: 200.0   # Hz -> 5 ms/point (OdmrLogic overrides via set_sample_rate)
-            # frame_timeout: null        # s; null -> auto (expected frame time x2 + 5 s)
-        # connect:                       # OPTIONAL: borrow a Time Tagger already owned elsewhere
-        #     tagger_provider: <owner_with_get_tagger>
-    """
-    # Required only when this module opens its OWN Pulse Streamer (no ps_provider connected).
-    _ps_ip = ConfigOption('pulsestreamer_ip', default=None)
-    _ps_channels = ConfigOption('ps_channels', missing='error')
-    _tt_serial = ConfigOption('timetagger_serial', default='')
-    _apd_channels = ConfigOption('apd_channels', missing='error')
-    _detect_tt_channel = ConfigOption('detect_tt_channel', default=5)
-    _input_channel_name = ConfigOption('input_channel_name', default='fluorescence')
-    # Dwell AFTER the SMIQ frequency-advance trigger and BEFORE the count window opens, so photons
-    # are integrated only once the SMIQ has settled at the new frequency. The SMIQ is slow to switch
-    # (~few ms, measurement_techniques.md); counting during the transit smears fluorescence across
-    # two frequencies. HARDWARE-SPECIFIC and to_be_confirmed vs the SMIQ settle spec -- TUNE against
-    # the device (raise until the dip stops depending on sweep direction). Shrinks the count window,
-    # so lower default_sample_rate if you need more count time.
-    _mw_settle_time = ConfigOption('mw_settle_time', default=1.0e-3)
-    _accumulate_fraction = ConfigOption('accumulate_fraction', default=0.9)
-    _next_pulse_ns = ConfigOption('next_pulse_ns', default=100)
-    # Advance the SMIQ at the START of each point (advance -> settle -> count) rather than the end.
-    # Which frequency each window is measured at depends on this AND on the SMIQ list's duplicated
-    # first entry (mw_source_smiq._write_list). VERIFY EMPIRICALLY (Phase 3 probe, RF off). SCAN-007.
-    _advance_at_start = ConfigOption('advance_at_start', default=True)
-    # CW-ODMR: hold the mw switch (ch4) OPEN for the whole line so RF passes continuously. Set False
-    # only for a pulsed variant (not this module). The SMIQ RF output itself is enabled by OdmrLogic
-    # (start_scan), gated by the human-confirmed power cap -- this only opens/closes the downstream
-    # switch.
-    _cw_mw_on = ConfigOption('cw_mw_on', default=True)
-    # 'sum'  -> ONE count window per point, mw switch (ch4) held OPEN the whole point (plain CW-ODMR):
-    #           output = PL count rate (this is what shows the fluorescence, incl. any baseline drift).
-    # 'diff' -> TWO windows per point: A with mw ON, then B with mw OFF; output = rate(A) - rate(B).
-    #           A and B are taken back-to-back at the SAME frequency, so a slowly-drifting PL baseline
-    #           (e.g. bleaching under illumination) is COMMON to both and cancels, leaving only the
-    #           mw-induced change -> a flat ~0 baseline with the resonance as a dip. The SMIQ RF must be
-    #           ON (as always for ODMR); the mw switch does the fast per-point on/off gating. Diff shows
-    #           ~0 everywhere until real RF reaches the sample (mw on/off then makes no PL difference).
-    _scan_mode = ConfigOption('scan_mode', default='sum')
-    _enable_laser = ConfigOption('enable_laser', default=False)
-    # Hold the laser ON continuously between sweep lines and after the scan (not just during each
-    # streamed line), so the PL source sees STEADY illumination instead of the laser blinking off
-    # between lines (which restarts bleaching transients and distorts the baseline). Only acts when
-    # enable_laser is True. Turn it off with laser_off(); the shared Pulse Streamer is also returned to
-    # LOW by its provider on qudi shutdown. (Operator request 2026-07-02.)
-    _keep_laser_on = ConfigOption('keep_laser_on', default=True)
-    # SCAN-006 arm barrier: a freshly created CountBetweenMarkers needs ~tens of ms to start
-    # listening; without this the first detect edges are lost -> count<->point registration slip.
-    _cbm_arm_delay = ConfigOption('cbm_arm_delay', default=0.05)
-    _default_sample_rate = ConfigOption('default_sample_rate', default=200.0)
-    # safety net: max seconds to wait for a Time Tagger frame before aborting (so a missing detect
-    # marker or a stalled SMIQ can't block the sweep forever). None -> auto (expected time x2 + 5 s).
-    _frame_timeout = ConfigOption('frame_timeout', default=None)
+    # Optional providers of the shared devices (qudi_notes provider convention). If a
+    # connector is not wired, this module opens its own connection and then OWNS the device.
+    _tagger_provider = Connector(name='tagger_provider', interface='TimeTaggerProvider',
+                                 optional=True)
+    _ps_provider = Connector(name='ps_provider', interface='PulseStreamerProvider',
+                             optional=True)
 
-    # OPTIONAL: borrow the Time Tagger from a dedicated owner module (timetagger_provider), so several
-    # modules share ONE connection. If not connected, this module opens its own (standalone ODMR use).
-    _tagger_provider = Connector(name='tagger_provider', interface='TimeTaggerProvider', optional=True)
-    # OPTIONAL: borrow the Pulse Streamer from a dedicated owner module (pulsestreamer_provider) so a
-    # combined confocal+ODMR config drives ONE Pulse Streamer connection rather than two independent
-    # ones. If not connected, this module opens its own (needs pulsestreamer_ip).
-    _ps_provider = Connector(name='ps_provider', interface='PulseStreamerProvider', optional=True)
+    # --- Pulse Streamer (master clock) ---
+    _pulsestreamer_ip = ConfigOption(name='pulsestreamer_ip', default='')
+    _ps_channels = ConfigOption(name='ps_channels',
+                                default={'laser': 0, 'mw': 4, 'detect': 1, 'next': 6})
+    # SMIQ frequency-advance pulse width in ns (rising edge is what matters).
+    _next_pulse_ns = ConfigOption(name='next_pulse_ns', default=100)
+    # Fire the advance at the point START (advance -> settle -> count), so point i is
+    # measured at frequency i given the SMIQ's duplicated first list entry. False = legacy
+    # (advance at the point end). Mapping to VERIFY empirically, RF off (runbook step 28).
+    _advance_at_start = ConfigOption(name='advance_at_start', default=True)
+
+    # --- Time Tagger counting ---
+    _apd_channels = ConfigOption(name='apd_channels', default=[1, 2])
+    _detect_tt_channel = ConfigOption(name='detect_tt_channel', default=5)
+    _input_channel_name = ConfigOption(name='input_channel_name', default='fluorescence')
+
+    # --- Per-point sequence timing ---
+    # Dwell after the SMIQ advance before counting (SMIQ frequency settle, ~ms — the real
+    # rate limiter, ODMR-001). Raise it if the dip depends on sweep direction.
+    _mw_settle_time = ConfigOption(name='mw_settle_time', default=1.0e-3)
+    _accumulate_fraction = ConfigOption(name='accumulate_fraction', default=0.9)
+
+    # --- Measurement mode ---
+    # 'sum' = raw PL vs frequency (1 window/point; shows the bleaching baseline).
+    # 'diff' = per point rate(mw ON) - rate(mw OFF) (2 windows/point; cancels the baseline).
+    _scan_mode = ConfigOption(name='scan_mode', default='sum')
+    # sum mode only: hold the mw switch OPEN for the whole point (CW ODMR). diff gates the
+    # switch over window A regardless of this option.
+    _cw_mw_on = ConfigOption(name='cw_mw_on', default=True)
+
+    # --- Laser (HUMAN-APPROVED actions, SAFE-003) ---
+    _enable_laser = ConfigOption(name='enable_laser', default=False)
+    # Hold the laser HIGH between sweep lines + after the scan (steady illumination — a
+    # blink re-triggers the PL bleaching transient). Acts when enable_laser is set.
+    _keep_laser_on = ConfigOption(name='keep_laser_on', default=True)
+
+    # --- Readout / lifecycle ---
+    _default_sample_rate = ConfigOption(name='default_sample_rate', default=200.0)
+    # ARM BARRIER (SCAN-006): a freshly created CountBetweenMarkers is not armed instantly;
+    # sync() + this delay before starting the Pulse Streamer, else a variable number of the
+    # first detect edges are lost and point 0 slips (0.05 s proven; every sweep line re-arms).
+    _cbm_arm_delay = ConfigOption(name='cbm_arm_delay', default=0.05)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._lock = Mutex()
+        self._thread_lock = RecursiveMutex()
+
+        # device handles + ownership flags (qudi_notes borrow-or-own convention)
         self._tagger = None
-        self._owns_tagger = False
         self._pulser = None
+        self._owns_tagger = False
         self._owns_pulser = False
+
+        # constraints
         self._constraints = None
-        # active sweep state
-        self._sample_rate = 0.0
+
+        # sampling state
+        self._sample_rate = -1.0
         self._frame_size = 0
         self._active_channels = frozenset()
-        self._cbm = None                    # TimeTagger.CountBetweenMarkers
-        self._combiner = None
-        self._detect_monitor = None         # TimeTagger.Countrate on the detect channel (diagnostic)
-        self._consumed_points = 0
-        self._frame_start_time = None
-        self._windows_per_point = 1          # 1 (sum) or 2 (diff: window A mw-on, B mw-off)
-        self._win_a_time = None              # window A integration time (s), set when seq is built
-        self._win_b_time = None              # window B integration time (s); diff mode only
 
-    # ---------------------------------------------------------------- lifecycle
+        # per-frame runtime state
+        self._cbm = None                 # TimeTagger CountBetweenMarkers
+        self._combiner = None            # TimeTagger Combiner (kept alive during frame)
+        self._consumed = 0               # points already returned to the consumer
+        self._unread = None              # post-stop snapshot dict (drain buffer, SCAN-003)
+        self._timed_out = False
+        self._frame_deadline = 0.0
+        self._frame_start = 0.0
+
+        # set when the sequence is built
+        self._win_time = 0.0             # single count-window duration in s
+        self._windows_per_point = 1      # 1 (sum) | 2 (diff)
+
+        # manual laser state (console laser_on()/laser_off()) — preserved across frames
+        # and restored at teardown (cycle-1 keep-laser lesson; scanner grading gap).
+        self._laser_is_on = False
+
+    # ---------------------------------------------------------------- activation
+
     def on_activate(self):
-        # Validate timing-critical config up front so a typo fails fast with a clear message rather
-        # than producing negative Pulse Streamer segment durations or a late error mid-sweep.
-        if not (0.0 < float(self._accumulate_fraction) < 1.0):
-            raise ValueError(f'accumulate_fraction must be in (0, 1), got {self._accumulate_fraction}')
-        if int(self._next_pulse_ns) <= 0:
-            raise ValueError(f'next_pulse_ns must be positive, got {self._next_pulse_ns}')
-        if str(self._scan_mode).lower() not in ('sum', 'diff'):
-            raise ValueError(f"scan_mode must be 'sum' or 'diff', got {self._scan_mode}")
-        for _name in ('_mw_settle_time', '_cbm_arm_delay'):
-            _val = getattr(self, _name)
-            if _val is not None and float(_val) < 0:
-                raise ValueError(f'{_name[1:]} must be >= 0, got {_val}')
-        for _key in ('laser', 'mw', 'detect', 'next'):
-            if _key not in self._ps_channels:
-                raise ValueError(f"ps_channels missing required key '{_key}'")
+        # --- config validation up front (a bad value must fail activation, not a scan) ---
+        if self._mw_settle_time < 0 or self._cbm_arm_delay < 0:
+            raise ValueError('mw_settle_time and cbm_arm_delay must be >= 0.')
+        if not 0.0 < self._accumulate_fraction < 1.0:
+            raise ValueError('accumulate_fraction must be in (0, 1): the low "skip" gaps '
+                             'around the count windows are what separates their marker edges '
+                             'and closes every window inside its own point block (SCAN-001).')
+        if self._scan_mode not in ('sum', 'diff'):
+            raise ValueError(f'scan_mode must be "sum" or "diff", got "{self._scan_mode}".')
+        required_ps_keys = {'laser', 'mw', 'detect', 'next'}
+        if not required_ps_keys.issubset(self._ps_channels):
+            raise ValueError(f'ps_channels must define {sorted(required_ps_keys)}.')
+        if int(self._next_pulse_ns) < 1:
+            raise ValueError('next_pulse_ns must be >= 1 ns.')
+        if len(self._apd_channels) < 1:
+            raise ValueError('apd_channels must name at least one Time Tagger channel.')
 
-        # Use a shared Pulse Streamer if a provider is connected (combined confocal+ODMR config), else
-        # open our own. When borrowing, DON'T force the outputs low here — the owner (e.g.
-        # confocal_scan_io) manages the idle state; only our own connection starts at ZERO.
-        ps_owner = None
-        try:
-            ps_owner = self._ps_provider()
-        except Exception:
-            ps_owner = None
-        if ps_owner is not None:
-            self._pulser = ps_owner.get_pulser()
-            self._owns_pulser = False
-            self.log.info('Using shared Pulse Streamer from the ps_provider module.')
-        else:
-            if not self._ps_ip:
-                raise ValueError('pulsestreamer_ip is required when no ps_provider connector is set')
-            self._pulser = ps.PulseStreamer(self._ps_ip)
-            self._owns_pulser = True
-            self._pulser.constant(ps.OutputState.ZERO())  # all outputs LOW (laser/mw OFF, no advance)
+        # --- constraints (FiniteSamplingInput carries units + rate/size limits only) ---
+        self._constraints = FiniteSamplingInputConstraints(
+            channel_units={self._input_channel_name: 'c/s'},
+            frame_size_limits=(1, int(1e7)),
+            sample_rate_limits=(0.1, 1e4)
+        )
 
-        # Use a shared Time Tagger if a provider module is connected, else open our own.
+        # --- Time Tagger: borrow from the provider if connected, else own ---
         provider = None
         try:
             provider = self._tagger_provider()
@@ -213,35 +230,57 @@ class OdmrScanInput(FiniteSamplingInputInterface):
         if provider is not None:
             self._tagger = provider.get_tagger()
             self._owns_tagger = False
-            self.log.info(f'Using shared Time Tagger, serial {self._tagger.getSerial()}.')
+            self.log.info(f'Time Tagger borrowed from provider (shared connection), '
+                          f'serial {self._tagger.getSerial()}.')
         else:
-            self._tagger = tt.createTimeTagger(self._tt_serial) if self._tt_serial \
-                else tt.createTimeTagger()
+            self._tagger = tt.createTimeTagger()
             self._owns_tagger = True
-            self.log.info(f'Connected own Time Tagger, serial {self._tagger.getSerial()}.')
+            self.log.info(f'Time Tagger connected (owned), '
+                          f'serial {self._tagger.getSerial()}.')
 
-        self._constraints = FiniteSamplingInputConstraints(
-            channel_units={self._input_channel_name: 'c/s'},
-            frame_size_limits=(1, int(1e7)),
-            sample_rate_limits=(0.1, 1e4),  # VALIDATE vs Pulse Streamer / SMIQ settle bandwidth
-        )
+        # --- Pulse Streamer: borrow from the provider if connected, else own ---
+        provider = None
+        try:
+            provider = self._ps_provider()
+        except Exception:
+            provider = None
+        if provider is not None:
+            self._pulser = provider.get_pulser()
+            self._owns_pulser = False
+            self.log.info('Pulse Streamer borrowed from provider (shared connection).')
+        else:
+            if not self._pulsestreamer_ip:
+                raise ValueError('No ps_provider connected and no pulsestreamer_ip configured.')
+            self._pulser = pstr.PulseStreamer(self._pulsestreamer_ip)
+            self._owns_pulser = True
+            self.log.info(f'Pulse Streamer connected (owned) at {self._pulsestreamer_ip}.')
+
+        # Idle/startup output state: ONLY asserted on an OWNED Pulse Streamer — the provider
+        # owns the startup state of a shared device (qudi_notes idle-state ruling).
+        if self._owns_pulser:
+            self._pulser.constant(pstr.OutputState.ZERO())
+
+        # defaults
         self._sample_rate = float(self._default_sample_rate)
+        self._active_channels = frozenset({self._input_channel_name})
         self._frame_size = 0
-        self._active_channels = frozenset(self._constraints.channel_names)
+        self._unread = None
+        self._consumed = 0
+        self._laser_is_on = False
+        self._windows_per_point = 2 if self._scan_mode == 'diff' else 1
 
     def on_deactivate(self):
         try:
             self.stop_buffered_acquisition()
         except Exception:
-            pass
-        # Force outputs LOW only if we OWN the Pulse Streamer; a borrowed one is managed by its owner
-        # (stop_buffered_acquisition above already returned a running sweep's outputs to ZERO).
+            self.log.exception('Error stopping acquisition on deactivate:')
+        # Only reset/free devices we OWN (deferential teardown, qudi_notes). A borrowed
+        # Pulse Streamer is zeroed by its provider on qudi shutdown.
         if self._owns_pulser and self._pulser is not None:
             try:
-                self._pulser.constant(ps.OutputState.ZERO())  # leave all outputs LOW (safe)
+                self._pulser.constant(pstr.OutputState.ZERO())
             except Exception:
                 pass
-        # Only free the device if we opened it ourselves (a borrowed tagger is owned elsewhere).
         if self._owns_tagger and self._tagger is not None:
             try:
                 tt.freeTimeTagger(self._tagger)
@@ -251,13 +290,15 @@ class OdmrScanInput(FiniteSamplingInputInterface):
         self._pulser = None
 
     # ---------------------------------------------------------------- properties
+
     @property
     def constraints(self):
         return self._constraints
 
     @property
     def active_channels(self):
-        return frozenset(self._active_channels)
+        """ @return frozenset: names of all currently active input channels """
+        return self._active_channels
 
     @property
     def sample_rate(self):
@@ -268,306 +309,421 @@ class OdmrScanInput(FiniteSamplingInputInterface):
         return self._frame_size
 
     @property
-    def samples_in_buffer(self):
-        # Points whose count window has closed and not yet been consumed.
-        if self.module_state() != 'locked' or self._cbm is None:
-            return 0
-        return max(0, self._available_points_total() - self._consumed_points)
+    def is_running(self):
+        """ Read-only flag: frame acquisition running (module_state locked). """
+        return self.module_state() == 'locked'
 
-    # ---------------------------------------------------------------- configuration
+    @property
+    def samples_in_buffer(self):
+        """ Number of acquired but unread points. When not running, reports the post-stop
+        snapshot length so the consumer can drain it (stock-contract behavior, SCAN-003). """
+        with self._thread_lock:
+            if not self.is_running:
+                if self._unread is None:
+                    return 0
+                return len(self._unread[self._input_channel_name])
+            return max(0, self._available_points_total() - self._consumed)
+
+    # ---------------------------------------------------------------- setters
+
     def set_sample_rate(self, rate):
-        lo, hi = self._constraints.sample_rate_limits
-        if not (lo <= float(rate) <= hi):
-            raise ValueError(f'Sample rate {rate} out of bounds {(lo, hi)}')
-        with self._lock:
-            if self.module_state() == 'locked':
-                raise RuntimeError('Unable to set sample rate. Acquisition in progress.')
-            self._sample_rate = float(rate)
+        assert not self.is_running, 'Unable to set sample rate while acquisition is running.'
+        in_range, clipped = self._constraints.sample_rate_in_range(rate)
+        if not in_range:
+            self.log.warning(f'Sample rate {rate:.3g} Hz out of bounds '
+                             f'{self._constraints.sample_rate_limits}; clipped to '
+                             f'{clipped:.3g} Hz.')
+        with self._thread_lock:
+            self._sample_rate = float(clipped)
 
     def set_active_channels(self, channels):
-        chnl_set = frozenset(channels)
-        if not chnl_set.issubset(self._constraints.channel_names):
-            raise ValueError(f'Invalid channels {channels}; allowed {self._constraints.channel_names}')
-        with self._lock:
-            if self.module_state() == 'locked':
-                raise RuntimeError('Unable to set active channels. Acquisition in progress.')
-            self._active_channels = chnl_set
+        assert not self.is_running, 'Unable to set active channels while acquisition is running.'
+        channels = frozenset(str(ch) for ch in channels)
+        assert channels.issubset(set(self._constraints.channel_names)), \
+            f'Invalid input channels: {channels.difference(self._constraints.channel_names)}'
+        assert len(channels) > 0, 'At least one active input channel required.'
+        with self._thread_lock:
+            self._active_channels = channels
 
     def set_frame_size(self, size):
-        samples = int(round(size))
-        if not self._constraints.frame_size_in_range(samples)[0]:
-            raise ValueError(f'frame size {samples} out of bounds {self._constraints.frame_size_limits}')
-        with self._lock:
-            if self.module_state() == 'locked':
-                raise RuntimeError('Unable to set frame size. Acquisition in progress.')
-            self._frame_size = samples
+        assert not self.is_running, 'Unable to set frame size while acquisition is running.'
+        size = int(round(size))
+        assert self._constraints.frame_size_in_range(size)[0], \
+            f'Frame size {size} out of range {self._constraints.frame_size_limits}.'
+        with self._thread_lock:
+            self._frame_size = size
 
-    # ---------------------------------------------------------------- Pulse Streamer sequence
-    def _build_point_sequence(self):
-        """ One frequency-point block (duration T = 1/sample_rate), streamed frame_size times.
+    # ---------------------------------------------------------------- frame lifecycle
 
-        Layout (advance_at_start=True): [next pulse ch6 -> advance SMIQ][settle][count region][tail].
-        (advance_at_start=False puts the next pulse at the END; 'lead' offset changes accordingly.)
-        sum mode  -> ONE count window over the whole count region; mw switch (ch4) held OPEN (CW).
-        diff mode -> TWO windows: A (mw ON) then B (mw OFF), split by a short 'skip' dead-gap that also
-                     lets the mw switch settle; mw (ch4) is HIGH over window A only. Output = A - B.
-        Each count window is bracketed by a detect rising (start) + falling (end) edge (ch1 -> TT ch5);
-        the trailing 'tail' low guarantees the last window closes inside the point (SCAN-001). 'laser'
-        (ch0) is HIGH for the whole point iff enable_laser.
-        """
-        T_ns = int(round(1e9 / self._sample_rate))
-        pw = int(min(self._next_pulse_ns, max(1, T_ns // 100)))
-        settle = int(round(float(self._mw_settle_time) * 1e9))
-        tail = pw
-        diff = str(self._scan_mode).lower() == 'diff'
-        ch = self._ps_channels
-        lead = (pw + settle) if self._advance_at_start else settle   # offset to the count region
-        L = T_ns - pw - settle - tail                                # count-region length
-        if L <= 0:
-            raise RuntimeError(
-                f'Invalid point timing: mw_settle_time={self._mw_settle_time} s + pulses leave no '
-                f'count region at {self._sample_rate} Hz (point {T_ns} ns). Lower mw_settle_time or '
-                f'the sample rate.')
-
-        def _seg(pairs):
-            return [(int(d), int(v)) for (d, v) in pairs if int(d) > 0]  # drop zero-length segments
-
-        def _pad(pattern):
-            s = sum(int(d) for d, _ in pattern)
-            return pattern + [(T_ns - s, 0)] if s < T_ns else pattern
-
-        seq = self._pulser.createSequence()
-        # SMIQ frequency-advance pulse (ch6): at the point START (default) or END (legacy)
-        if self._advance_at_start:
-            seq.setDigital(ch['next'], _seg([(pw, 1), (T_ns - pw, 0)]))
-        else:
-            seq.setDigital(ch['next'], _seg([(T_ns - pw, 0), (pw, 1)]))
-
-        if not diff:
-            skip = int(round((1.0 - float(self._accumulate_fraction)) * L))
-            count_win = L - skip
-            if count_win <= 0:
-                raise RuntimeError(f'Invalid point timing: count window {count_win} ns at '
-                                   f'{self._sample_rate} Hz. Lower mw_settle_time or sample rate.')
-            self._win_a_time = count_win / 1e9
-            self._win_b_time = None
-            seq.setDigital(ch['detect'], _seg(_pad([(lead + skip, 0), (count_win, 1), (tail, 0)])))
-            if self._cw_mw_on:
-                seq.setDigital(ch['mw'], [(T_ns, 1)])       # mw switch OPEN for the whole point (CW)
-        else:
-            half = L // 2
-            skip = int(round((1.0 - float(self._accumulate_fraction)) / 2.0 * L))
-            win_a = half - skip
-            win_b = L - half - skip
-            if win_a <= 0 or win_b <= 0:
-                raise RuntimeError(f'Invalid diff timing: window A={win_a} ns, B={win_b} ns at '
-                                   f'{self._sample_rate} Hz. Lower mw_settle_time or the sample rate.')
-            self._win_a_time = win_a / 1e9
-            self._win_b_time = win_b / 1e9
-            # detect: [lead+skip low][A high][skip low][B high][tail low] -> 2 windows/point
-            seq.setDigital(ch['detect'], _seg(_pad([(lead + skip, 0), (win_a, 1),
-                                                    (skip, 0), (win_b, 1), (tail, 0)])))
-            # mw switch OPEN over window A region only ([lead, lead+half)), CLOSED over window B
-            seq.setDigital(ch['mw'], _seg(_pad([(lead, 0), (half, 1)])))
-        if self._enable_laser:
-            seq.setDigital(ch['laser'], [(T_ns, 1)])    # laser HIGH -- HUMAN-APPROVED
-        return seq
-
-    # ---------------------------------------------------------------- acquisition control
     def start_buffered_acquisition(self):
-        with self._lock:
-            if self.module_state() == 'locked':
-                raise RuntimeError('Acquisition already running')
-            if self._frame_size < 1:
-                raise RuntimeError('No frame size set (need > 0 frequency points)')
-            self.module_state.lock()
-            try:
-                n = self._frame_size
-                self._windows_per_point = 2 if str(self._scan_mode).lower() == 'diff' else 1
-                # Time Tagger: combine APDs, count between detect rising/falling edges. ONE window per
-                # point in sum mode, TWO (mw-on A, mw-off B) in diff mode.
-                self._combiner = tt.Combiner(self._tagger, channels=list(self._apd_channels))
-                self._cbm = tt.CountBetweenMarkers(
-                    self._tagger,
-                    click_channel=self._combiner.getChannel(),
-                    begin_channel=int(self._detect_tt_channel),
-                    end_channel=-int(self._detect_tt_channel),   # falling edge of same channel
-                    n_values=n * self._windows_per_point)
-                # diagnostic: detect edges actually arriving at the Time Tagger during the frame
-                self._detect_monitor = tt.Countrate(self._tagger, [int(self._detect_tt_channel)])
-                self._consumed_points = 0
+        """ Arm the Time Tagger measurement (with the SCAN-006 arm barrier), then start the
+        Pulse Streamer per-point master sequence. Non-blocking. """
+        assert self._frame_size > 0, 'No frame size set. Cannot start acquisition.'
+        assert not self.is_running, 'Acquisition already running. Cannot start.'
+        assert self._constraints.sample_rate_in_range(self._sample_rate)[0], \
+            f'Cannot start acquisition: sample rate {self._sample_rate:.3g} Hz invalid.'
 
-                # ARM BARRIER (SCAN-006): arm the Time Tagger measurements BEFORE starting the Pulse
-                # Streamer, else a variable number of the first 'detect' edges are lost.
+        self.module_state.lock()
+        try:
+            with self._thread_lock:
+                self._consumed = 0
+                self._unread = None
+                self._timed_out = False
+
+                # (1) Arm the Time Tagger CountBetweenMarkers: 1 (sum) or 2 (diff) windows
+                # per point, begin/end = detect rising/falling edge (same physical channel,
+                # ch_end = -ch_start — connections.yaml).
+                self._init_cbm()
+
+                # (2) ARM BARRIER (SCAN-006): a fresh CountBetweenMarkers needs tens of ms
+                # to actually start listening; EVERY sweep line re-arms, so without this the
+                # first point(s) of each line would slip. sync() is guarded so its absence
+                # cannot break start-up; the fixed delay alone already fixes the arm race.
                 try:
                     self._tagger.sync()
                 except Exception:
-                    pass
-                if self._cbm_arm_delay and float(self._cbm_arm_delay) > 0:
-                    time.sleep(float(self._cbm_arm_delay))
+                    self.log.warning('Time Tagger sync() failed/unavailable; relying on '
+                                     'cbm_arm_delay alone (SCAN-006).')
+                if self._cbm_arm_delay > 0:
+                    time.sleep(self._cbm_arm_delay)
 
-                # Pulse Streamer: play the point block n times (advances the SMIQ + gates the TT).
-                # IMMEDIATE start so it runs as soon as streamed (the TT is already armed above).
-                # Each point's detect pattern ends with a 'tail' LOW, so the last count window's closing
-                # edge occurs WITHIN the sequence (SCAN-001); the stream 'final' state is just the idle
-                # output held AFTER the sequence. Hold the LASER HIGH as that final state when
-                # keep_laser_on, so there is NO laser-off gap at the end of each sweep line (steady
-                # illumination between lines -> no re-bleaching transient). The final state raises ONLY
-                # the laser channel (detect/mw/advance stay LOW), so window closure is unaffected.
-                # Otherwise all outputs LOW.
-                final_state = ps.OutputState([int(self._ps_channels['laser'])], 0, 0) \
-                    if (self._keep_laser_on and self._enable_laser) else ps.OutputState.ZERO()
-                self._pulser.setTrigger(start=ps.TriggerStart.IMMEDIATE)
-                self._pulser.stream(self._build_point_sequence(), n, final_state)
-                self._frame_start_time = time.perf_counter()
-            except Exception:
+                # (3) Start the Pulse Streamer master sequence (immediate trigger). It emits
+                # exactly frame_size repetitions of the per-point block and stops; every
+                # detect window closes inside its own point block (SCAN-001), and the FINAL
+                # output state keeps the laser HIGH between sweep lines iff keep_laser_on
+                # (steady illumination — the cycle-1 final-state fix) else all-LOW.
+                seq = self._build_point_sequence()
+                self._pulser.setTrigger(pstr.TriggerStart.IMMEDIATE)
+                self._pulser.stream(seq, self._frame_size, self._between_frames_state())
+
+                self._frame_start = time.time()
+                frame_duration = self._frame_size / self._sample_rate
+                # Timeout backstop: return data instead of hanging forever (SCAN-001).
+                self._frame_deadline = self._frame_start + 1.25 * frame_duration + 5.0
+        except Exception:
+            try:
                 self._teardown()
+            finally:
                 self.module_state.unlock()
-                raise
+            raise
 
     def stop_buffered_acquisition(self):
-        # Must NOT raise if nothing is running (interface contract).
-        with self._lock:
-            if self.module_state() == 'locked':
-                self._teardown()
-                self.module_state.unlock()
+        """ Abort the running frame. Snapshot unread points for post-stop draining, stop the
+        PS sequence (laser held per keep_laser_on), release the TT measurement.
+        Must NOT raise if no acquisition is running. """
+        if not self.is_running:
+            return
+        with self._thread_lock:
+            if not self.is_running:
+                return
+            self._teardown()
+            self.module_state.unlock()
 
-    def _teardown(self):
-        # Return the Pulse Streamer to idle. If keep_laser_on (and the laser is enabled), HOLD the
-        # laser channel HIGH so the PL source keeps steady illumination between sweep lines and after
-        # the scan (no blink -> no re-bleaching transient); otherwise all outputs LOW. mw switch and
-        # the advance line always go LOW here. on_deactivate forces all-LOW for a self-owned Streamer.
-        try:
-            if self._pulser is not None:
-                if self._keep_laser_on and self._enable_laser:
-                    self._pulser.constant(ps.OutputState([int(self._ps_channels['laser'])], 0, 0))
-                else:
-                    self._pulser.constant(ps.OutputState.ZERO())
-        except Exception:
-            pass
-        # Defensively stop the Time Tagger measurements before dropping references (guarded).
-        for _meas in (self._cbm, self._detect_monitor):
+    def get_buffered_samples(self, number_of_samples=None):
+        """ Return acquired points for the active input channel.
+
+        Contract (interface + stock-module behavior, SCAN-003/004 lessons):
+          - not running: drain the post-stop snapshot; empty arrays once drained; ValueError
+            if an explicit request exceeds what is left.
+          - running: an explicit request exceeding the points pending in the REST OF THE
+            FRAME raises ValueError immediately — never blocks for points that can no longer
+            arrive; otherwise blocks until the requested number is available.
+          - number_of_samples=None returns what is available (>= 1 point target, so the
+            readout advances even with zero photons — closed windows are counted via
+            getBinWidths(), independent of photon count, SCAN-002).
+        """
+        if number_of_samples is not None:
+            assert isinstance(number_of_samples, (int, np.integer)), \
+                'Number of requested samples must be integer.'
+            number_of_samples = int(number_of_samples)
+
+        with self._thread_lock:
+            if not self.is_running:
+                return self._drain_unread(number_of_samples)
+            pending_in_frame = self._frame_size - self._consumed
+            if number_of_samples is not None and number_of_samples > pending_in_frame:
+                raise ValueError(f'Requested {number_of_samples} samples but only '
+                                 f'{pending_in_frame} pending in this frame.')
+            if number_of_samples == 0 or (number_of_samples is None and pending_in_frame == 0):
+                return {self._input_channel_name: np.empty(0, dtype=np.float64)}
+            target = number_of_samples if number_of_samples is not None else 1
+
+        # Wait OUTSIDE the lock so stop_buffered_acquisition() can always proceed.
+        while True:
+            with self._thread_lock:
+                if not self.is_running:
+                    # frame was stopped while we waited -> post-stop drain path
+                    return self._drain_unread(number_of_samples)
+                available = self._available_points_total()
+                if available - self._consumed >= target:
+                    n = number_of_samples if number_of_samples is not None \
+                        else available - self._consumed
+                    values = self._points_from_windows(self._consumed, n)
+                    self._consumed += n
+                    return {self._input_channel_name: values}
+                if time.time() > self._frame_deadline and not self._timed_out:
+                    self._log_timeout_diagnostic()
+                    # Backstop (SCAN-001): report the frame complete; unclosed windows read
+                    # as zero counts, so the consumer gets a blank remainder, not a hang.
+                    self._timed_out = True
+                    continue
+            time.sleep(0.01)
+
+    def acquire_frame(self, frame_size=None):
+        """ Blocking single-frame acquisition (one ODMR sweep line — this is what OdmrLogic
+        calls per line). An explicit frame_size is valid for this frame only. """
+        with self._thread_lock:
+            remembered = None
+            if frame_size is not None and int(frame_size) != self._frame_size:
+                remembered = self._frame_size
+                self.set_frame_size(frame_size)
             try:
-                if _meas is not None:
-                    _meas.stop()
-            except Exception:
-                pass
-        self._cbm = None
-        self._combiner = None
-        self._detect_monitor = None
+                self.start_buffered_acquisition()
+                try:
+                    result = self.get_buffered_samples(self._frame_size)
+                finally:
+                    self.stop_buffered_acquisition()
+            finally:
+                if remembered is not None:
+                    self.set_frame_size(remembered)
+            return result
+
+    # ---------------------------------------------------------------- console helpers
+
+    def laser_on(self):
+        """ HUMAN console action (standing laser approval, SAFE-003): hold the laser gate
+        HIGH via a constant Pulse Streamer state. Works on a borrowed PS too — an explicit
+        human call is the sanctioned way to light the laser outside a sweep (qudi_notes).
+        The state is remembered and preserved across sweep frames. """
+        if self.is_running:
+            self.log.error('Refusing laser_on(): an ODMR frame is running.')
+            return
+        self._laser_is_on = True
+        self._pulser.constant(self._laser_output_state(True))
+        self.log.warning('Laser gate HIGH (console laser_on — human-approved action).')
 
     def laser_off(self):
-        """ Turn the laser OFF (Pulse Streamer all outputs LOW). Use when done with a continuous-laser
-        (keep_laser_on) ODMR session to stop illumination. Refuses during a running sweep. """
-        with self._lock:
-            if self.module_state() == 'locked':
-                raise RuntimeError('Refusing to change the laser during a running ODMR sweep.')
-            if self._pulser is not None:
-                self._pulser.constant(ps.OutputState.ZERO())
-        self.log.info('Laser OFF: Pulse Streamer outputs all zero.')
+        """ Return all Pulse Streamer outputs to LOW (laser off). This is the way to stop
+        the light after a keep_laser_on sweep. """
+        if self.is_running:
+            self.log.error('Refusing laser_off(): an ODMR frame is running.')
+            return
+        self._laser_is_on = False
+        self._pulser.constant(pstr.OutputState.ZERO())
+        self.log.info('Pulse Streamer outputs LOW (laser off).')
 
-    def get_tagger(self):
-        """ Return the underlying TimeTagger object so another module (e.g. a live photon counter)
-        can run additional measurements on the SAME device (multiple measurements per connection). """
-        return self._tagger
+    def set_mw_settle_time(self, seconds):
+        """ Runtime tuning knob (ODMR-001): dwell after the SMIQ frequency advance before
+        counting. Takes effect at the next frame build. Raise it if the dip position depends
+        on sweep direction. """
+        if seconds < 0:
+            raise ValueError('mw_settle_time must be >= 0.')
+        self._mw_settle_time = float(seconds)
 
-    # ---------------------------------------------------------------- readout
-    def _windows_to_points(self, counts):
-        """ Convert the per-window photon counts (length frame_size * windows_per_point) to one value
-        per frequency point, using each window's actual integration time.
-        sum  -> count rate (c/s) of the single window.
-        diff -> rate(A, mw ON) - rate(B, mw OFF): the common PL baseline (bleaching) cancels, leaving
-                the mw-induced change (a dip at resonance on a ~0 baseline). """
-        counts = np.asarray(counts, dtype=np.float64)
-        if self._windows_per_point == 2:
-            ab = counts.reshape(-1, 2)
-            ta = self._win_a_time if self._win_a_time else 1.0
-            tb = self._win_b_time if self._win_b_time else ta
-            return ab[:, 0] / ta - ab[:, 1] / tb
-        win_time = self._win_a_time if self._win_a_time else \
-            (float(self._accumulate_fraction) / self._sample_rate)
-        return counts / win_time
+    def set_scan_mode(self, mode):
+        """ Runtime switch between 'sum' (raw PL, 1 window/point) and 'diff' (mw ON-OFF,
+        2 windows/point). Not allowed while a frame is running. NOTE: this changes the
+        MEANING of the streamed values; restart the ODMR scan in the GUI afterwards. """
+        if self.is_running:
+            raise RuntimeError('Cannot change scan_mode while acquisition is running.')
+        if mode not in ('sum', 'diff'):
+            raise ValueError(f'scan_mode must be "sum" or "diff", got "{mode}".')
+        with self._thread_lock:
+            self._scan_mode = mode
+            self._windows_per_point = 2 if mode == 'diff' else 1
+        self.log.info(f'ODMR scan_mode set to "{mode}".')
+
+    # ---------------------------------------------------------------- internals
+
+    def _laser_output_state(self, laser_high):
+        digital_high = [int(self._ps_channels['laser'])] if laser_high else []
+        return pstr.OutputState(digital_high, 0.0, 0.0)
+
+    def _laser_in_scan(self):
+        """ Laser gate level inside the point sequence: HIGH iff enable_laser OR the laser
+        was manually turned on (continuity — a scan must not blink a burning laser). """
+        return bool(self._enable_laser) or self._laser_is_on
+
+    def _between_frames_state(self):
+        """ Pulse Streamer FINAL/teardown state: laser HIGH between sweep lines and after
+        the scan iff (enable_laser and keep_laser_on) or a manual laser_on() is active —
+        steady illumination, no re-bleaching blink (cycle-1 final-state fix). Else all LOW.
+        mw and next are ALWAYS LOW between frames (no RF gate, no stray SMIQ advance). """
+        hold = (self._enable_laser and self._keep_laser_on) or self._laser_is_on
+        return self._laser_output_state(hold)
+
+    def _init_cbm(self):
+        """ Fresh CountBetweenMarkers on the (combined) APD channels: begin = detect rising
+        edge, end = detect falling edge (ch_end = -ch_start, connections.yaml),
+        n_values = windows_per_point * frame_size. """
+        apd = [int(ch) for ch in self._apd_channels]
+        if len(apd) > 1:
+            self._combiner = tt.Combiner(self._tagger, apd)
+            click_channel = self._combiner.getChannel()
+        else:
+            self._combiner = None
+            click_channel = apd[0]
+        self._cbm = tt.CountBetweenMarkers(self._tagger,
+                                           click_channel=click_channel,
+                                           begin_channel=int(self._detect_tt_channel),
+                                           end_channel=-int(self._detect_tt_channel),
+                                           n_values=self._windows_per_point * self._frame_size)
+
+    def _build_point_sequence(self):
+        """ One point block (repeated frame_size times by the Pulse Streamer). All durations
+        in ns; every channel pattern sums exactly to the point period T.
+
+        advance_at_start=True (default):
+            next:   [pulse pn][LOW T-pn]
+            sum:    detect [pn+settle+skip LOW][win HIGH][skip LOW]
+                    mw     [T HIGH iff cw_mw_on]
+            diff:   detect [pn+settle+skip LOW][win A HIGH][2*skip LOW][win B HIGH][skip LOW]
+                    mw     [pn+settle LOW][half HIGH][half LOW]   (open over the A half only;
+                    the lead skip inside the half gives the switch time to settle before A)
+        legacy (advance_at_start=False): same counting layout, next pulse at the block END.
+
+        Every detect falling edge lies INSIDE its own block (trailing skip > 0 because
+        accumulate_fraction < 1) so the last window always closes (SCAN-001) regardless of
+        the sequence final state. The laser channel is a constant level over the block. """
+        T = int(round(1e9 / self._sample_rate))                 # point period
+        pn = int(max(1, min(int(self._next_pulse_ns), max(1, T // 100))))
+        settle = int(round(self._mw_settle_time * 1e9))
+        lead = pn + settle if self._advance_at_start else settle
+        tail_pn = 0 if self._advance_at_start else pn
+        usable = T - lead - tail_pn
+
+        if self._scan_mode == 'diff':
+            half = usable // 2
+            rem = usable - 2 * half
+            skip = max(1, int(round((1.0 - self._accumulate_fraction) / 2.0 * half)))
+            win = half - 2 * skip
+        else:
+            rem = 0
+            skip = max(1, int(round((1.0 - self._accumulate_fraction) / 2.0 * usable)))
+            win = usable - 2 * skip
+
+        if win <= 0:
+            raise ValueError(
+                f'Count window non-positive ({win} ns) at {self._sample_rate:.3g} Hz with '
+                f'mw_settle_time={self._mw_settle_time:.3g} s, accumulate_fraction='
+                f'{self._accumulate_fraction}: lower the data rate or the settle time.')
+
+        def pattern(segments):
+            """ (duration_ns, level) list, dropping zero-length segments. """
+            return [(int(d), int(lvl)) for d, lvl in segments if int(d) > 0]
+
+        if self._advance_at_start:
+            next_ch = pattern([(pn, 1), (T - pn, 0)])
+        else:
+            next_ch = pattern([(T - pn, 0), (pn, 1)])
+
+        if self._scan_mode == 'diff':
+            detect = pattern([(lead + skip, 0), (win, 1), (2 * skip, 0), (win, 1),
+                              (skip + rem + tail_pn, 0)])
+            mw = pattern([(lead, 0), (half, 1), (half + rem + tail_pn, 0)])
+        else:
+            detect = pattern([(lead + skip, 0), (win, 1), (skip + tail_pn, 0)])
+            mw = pattern([(T, 1 if self._cw_mw_on else 0)]) or [(T, 0)]
+
+        laser = pattern([(T, 1 if self._laser_in_scan() else 0)]) or [(T, 0)]
+
+        # per-window integration time for the c/s normalization (A and B are EQUAL here by
+        # construction, unlike the scanner's SCAN-008 tail asymmetry)
+        self._win_time = win * 1e-9
+
+        seq = self._pulser.createSequence()
+        seq.setDigital(int(self._ps_channels['next']), next_ch)
+        seq.setDigital(int(self._ps_channels['detect']), detect)
+        seq.setDigital(int(self._ps_channels['mw']), mw)
+        seq.setDigital(int(self._ps_channels['laser']), laser)
+        return seq
 
     def _available_points_total(self):
-        """ Points whose count window has CLOSED, read from the Time Tagger itself.
-        CountBetweenMarkers.getBinWidths() returns each window's accumulation time: a closed window
-        has width > 0, a not-yet-closed window has width 0 -- independent of photon count, so it works
-        with the laser off (SCAN-002). windows_per_point windows per point (1 sum, 2 diff): a point is
-        complete only when ALL its windows have closed. """
+        """ Points physically complete so far. Authority = the CLOSED-window count from
+        CountBetweenMarkers.getBinWidths() (>0 = window closed, independent of photon
+        count — SCAN-002). No NI AO here, so no task-done snap at all. """
+        if self._timed_out:
+            return self._frame_size
         if self._cbm is None:
-            return 0
-        try:
-            closed = int(np.count_nonzero(np.asarray(self._cbm.getBinWidths())))
-        except Exception:
-            closed = 0
-        return max(0, min(closed // self._windows_per_point, self._frame_size))
+            return self._consumed
+        closed_windows = int(np.count_nonzero(self._cbm.getBinWidths()))
+        return min(closed_windows // self._windows_per_point, self._frame_size)
 
-    def _log_frame_timeout(self, timeout):
+    def _points_from_windows(self, first_point, n_points):
+        """ Convert CountBetweenMarkers windows to per-point c/s values.
+        sum  (1 window/point):  rate = counts / t_win
+        diff (2 windows/point, order A,B per point): rate(A) - rate(B) = (A - B) / t_win
+        (equal windows). Diff values are legitimately NEGATIVE off-resonance noise. """
+        if n_points <= 0:
+            return np.empty(0, dtype=np.float64)
+        counts = np.asarray(self._cbm.getData(), dtype=np.float64)
+        if self._scan_mode == 'diff':
+            a = counts[0::2][first_point:first_point + n_points]
+            b = counts[1::2][first_point:first_point + n_points]
+            return (a - b) / self._win_time
+        return counts[first_point:first_point + n_points] / self._win_time
+
+    def _drain_unread(self, number_of_samples):
+        """ Post-stop drain (stock contract, SCAN-003): keep returning buffered/empty
+        samples after the frame stopped; ValueError only when an explicit request exceeds
+        what is left. Called with the thread lock held. """
+        name = self._input_channel_name
+        buffered = np.empty(0, dtype=np.float64) if self._unread is None \
+            else self._unread[name]
+        if number_of_samples is None:
+            self._unread = {name: np.empty(0, dtype=np.float64)}
+            return {name: buffered}
+        if number_of_samples > len(buffered):
+            raise ValueError(f'Requested {number_of_samples} samples but only '
+                             f'{len(buffered)} buffered after stop.')
+        self._unread = {name: buffered[number_of_samples:]}
+        return {name: buffered[:number_of_samples]}
+
+    def _teardown(self):
+        """ Stop everything, leave outputs safe. Snapshot the not-yet-consumed points into
+        the drain buffer BEFORE releasing the CountBetweenMarkers. The Pulse Streamer goes
+        to the between-frames state (laser held HIGH iff keep_laser_on / manual laser_on —
+        steady illumination between sweep lines); mw + next always end LOW.
+        Called with the thread lock held. """
+        # (1) snapshot remaining points for post-stop draining
         try:
-            detect_rate = float(self._detect_monitor.getData()[0])
+            available = self._available_points_total()
+            n_rest = max(0, available - self._consumed)
+            values = self._points_from_windows(self._consumed, n_rest)
         except Exception:
-            detect_rate = -1.0
+            self.log.exception('Could not snapshot unread samples on teardown:')
+            values = np.empty(0, dtype=np.float64)
+        self._unread = {self._input_channel_name: values}
+        self._consumed = 0
+
+        # (2) Pulse Streamer -> between-frames state (keep_laser_on) / all LOW
         try:
-            closed = int(np.count_nonzero(np.asarray(self._cbm.getBinWidths())))
+            if self._pulser is not None:
+                self._pulser.constant(self._between_frames_state())
+        except Exception:
+            self.log.exception('Could not stop the Pulse Streamer sequence:')
+
+        # (3) Time Tagger measurement (after the snapshot!)
+        if self._cbm is not None:
+            try:
+                self._cbm.stop()
+            except Exception:
+                pass
+            self._cbm = None
+        self._combiner = None
+
+    def _log_timeout_diagnostic(self):
+        """ In-frame diagnostic: localize a stuck sweep line — closed-window count vs
+        expected tells a hardware shortfall (markers not arriving / SMIQ stalled sweep has
+        no effect here, the PS free-runs) apart from readout bugs. """
+        try:
+            closed = int(np.count_nonzero(self._cbm.getBinWidths())) if self._cbm else -1
         except Exception:
             closed = -1
         self.log.error(
-            f'ODMR sweep line timed out after {timeout:.1f} s ({self._frame_size} points @ '
-            f'{self._sample_rate} Hz). DIAGNOSTICS: detect-edge rate = {detect_rate:.0f}/s '
-            f'(expect ~{self._sample_rate:.0f}); closed windows = {closed} of {self._frame_size}. '
-            f'detect~0 -> markers not reaching the Time Tagger (check ch1->TT ch5); '
-            f'closed~N-1 -> last window not closing (tail/final-state). Returning zeros for the rest.')
-
-    def get_buffered_samples(self, number_of_samples=None):
-        with self._lock:
-            if self.module_state() != 'locked':
-                raise RuntimeError('Unable to read samples. Acquisition is not running.')
-            remaining_in_frame = self._frame_size - self._consumed_points
-            if number_of_samples is not None and int(number_of_samples) > remaining_in_frame:
-                raise ValueError(f'Requested {number_of_samples} samples but only '
-                                 f'{remaining_in_frame} pending in this frame')
-            target = self._available_points_total() - self._consumed_points \
-                if number_of_samples is None else int(number_of_samples)
-            if target < 1:
-                return {ch: np.empty(0, dtype=np.float64) for ch in self._active_channels}
-
-            timeout = float(self._frame_timeout) if self._frame_timeout else \
-                (self._frame_size / max(self._sample_rate, 1e-9)) * 2.0 + 5.0
-            deadline = time.perf_counter() + timeout
-            while (self._available_points_total() - self._consumed_points) < target:
-                if time.perf_counter() > deadline:
-                    self._log_frame_timeout(timeout)
-                    remaining = self._frame_size - self._consumed_points
-                    self._consumed_points = self._frame_size
-                    return {ch: np.zeros(remaining, dtype=np.float64) for ch in self._active_channels}
-                time.sleep(min(max(1.0 / self._sample_rate, 1e-3), 0.05))
-
-            points = self._windows_to_points(np.asarray(self._cbm.getData()))  # length frame_size
-            block = points[self._consumed_points:self._consumed_points + target]
-            self._consumed_points += target
-            return {ch: np.asarray(block, dtype=np.float64) for ch in self._active_channels}
-
-    def acquire_frame(self, frame_size=None):
-        """ Acquire one full sweep line (blocking): configure, run, and return the per-point counts.
-
-        OdmrLogic calls this once per sweep with no argument (it has already set the frame size via
-        set_frame_size). Mirrors the finite_sampling_input_dummy contract.
-        """
-        with self._lock:
-            restore = None
-            if frame_size is not None:
-                restore = self._frame_size
-                samples = int(round(frame_size))
-                if not self._constraints.frame_size_in_range(samples)[0]:
-                    raise ValueError(f'frame size {samples} out of bounds '
-                                     f'{self._constraints.frame_size_limits}')
-                self._frame_size = samples
-        try:
-            self.start_buffered_acquisition()
-            data = self.get_buffered_samples(self.frame_size)
-            self.stop_buffered_acquisition()
-            return data
-        finally:
-            if restore is not None:
-                with self._lock:
-                    self._frame_size = restore
+            f'ODMR frame timeout after {time.time() - self._frame_start:.1f} s: '
+            f'{closed} of {self._windows_per_point * self._frame_size} count windows '
+            f'closed, consumed {self._consumed}/{self._frame_size} points. Returning '
+            f'remaining points as zeros instead of hanging (SCAN-001 backstop). If windows '
+            f'are missing, probe qudi-closed first (detect-edge rate on TT ch5) before '
+            f'changing readout code.')
