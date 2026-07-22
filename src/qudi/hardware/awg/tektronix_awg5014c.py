@@ -3,43 +3,63 @@
 """
 Qudi hardware module for the Tektronix AWG5014C arbitrary waveform generator.
 
-FORK MODULE (confocal_odmr, cycle 2, AWG intake phase B — 2026-07-22).
-Adapted from the legacy-interface donor tektronix_awg5002c.py (same AWG5000 series,
-SCPI + .wfm + FTP architecture) and ported to the CURRENT PulserInterface following
-the tektronix_awg70k.py patterns (pyvisa transport, write_waveform/load_waveform API).
+FORK MODULE (confocal_odmr, cycle 2, AWG intake — phase B 2026-07-22, revised same day
+after REQ-028 was answered). Originally adapted from the legacy-interface donor
+tektronix_awg5002c.py and ported to the CURRENT PulserInterface following the
+tektronix_awg70k.py patterns (pyvisa transport, write_waveform/load_waveform API).
 
-PHASE-B SCOPE (mock-first; no instrument contact):
-  * SCPI control via VISA/GPIB (NI GPIB-USB-HS; resource per probe_awg5014c_idn.py).
-  * Waveform files (.wfm) are written locally; upload uses the donor's FTP path but the
-    FTP address is a SEPARATE config option, default None => upload DISABLED with a loud
-    error (the ethernet link is phase C, connections.yaml devices.awg to_be_confirmed).
+SCOPE (phase B+, mock-first; no instrument contact by this module yet):
+  * SCPI control via VISA/GPIB (NI GPIB-USB-HS; GPIB0::1::INSTR probe-confirmed
+    2026-07-22, connections.yaml devices.awg).
+  * Waveform TRANSFER via SCPI WLISt:WAVeform:DATA over the SAME VISA link (works over
+    GPIB — no ethernet needed). The donor's FTP/.wfm path was REMOVED 2026-07-22
+    (REQ-030 decision, operator-approved): the .wfm file byte layout was never sourced,
+    while the WLISt integer format IS sourced (see below).
   * SEQUENCE MODE IS OUT OF SCOPE (non-goal this phase): sequence_option = NON,
     write/load_sequence fail loudly. Planned for phase D+.
 
-CONSTRAINTS ARE PARAMETERIZED, NOT SOURCED (REQ-028 open when this was written):
-  shared_knowledge/device_models.md has NO AWG5014C entry yet. All 5014C-specific limits
-  below are ConfigOptions with deliberately CONSERVATIVE (understating) defaults and must
-  be reconciled against the datasheet-sourced device_models entry when REQ-028 is answered:
-    sample_rate_max      default 600.0e6  (donor 5002C value; 5014C spec is believed higher)
-    min_waveform_length  default 250      (conservative family guess)
-    waveform_granularity default 4        (conservative: rejects lengths a granularity-1
-                                           instrument would accept — safe direction)
-    max_waveform_length  default 4_000_000 (conservative; well under any 5014C memory size)
-  Family values kept from the donor (amplitude/offset/marker ranges, sample_rate min)
-  are marked TBC(REQ-028) inline.
+CONSTRAINTS RECONCILED 2026-07-22 (REQ-028 answered — shared_knowledge/device_models.md
+AWG5014C entry, sourced from Tektronix Technical Reference 077-0455-03 spec tables;
+in-repo extract in setups/confocal_odmr/hardware_manuals/). The limits remain
+ConfigOptions so another setup/unit can override them, but the DEFAULTS are now the
+sourced values:
+    sample_rate:          10 MS/s .. 1.2 GS/s          (Tech Ref Table 3)
+    min_waveform_length:  250 points (HARDWARE limit)  (Tech Ref Table 2)
+    waveform_granularity: 1 point                      (Tech Ref Table 2)
+    max_waveform_length:  32_400_000 (Opt 01 — installed on this unit, REQ-028;
+                          base instrument without Opt 01: 16_200_000)
+    analog levels:        20 mV..4.5 Vp-p SE Normal, offset ±2.25 V (Table 7)
+    marker levels:        window −1.0..+2.7 V, min amplitude 0.1 V (Table 8)
 
-SOURCED PROTOCOL FACTS (AWG5000/7000 Series Programmer Manual 077006105 Rev A, partial
-extract fetched 2026-07-22 -> setups/confocal_odmr/hardware_manuals/):
+SOURCED PROTOCOL FACTS:
+  * Integer waveform data format (Programmer Manual 077-0061-05 Table 2-25, in-repo
+    extract): 2 bytes per point, transferred LSB-first; bit layout M2 M1 D13..D0
+    (14 data bits, marker 1 = bit 14, marker 2 = bit 15).
+  * WLISt:WAVeform:DATA supports chunked transfer via StartIndex/Size parameters
+    (extract, "Transferring Waveforms in Chunks") — NOT used here: the exact chunk
+    argument order is on a manual page missing from the extract, so this module
+    accumulates qudi's chunks locally and sends ONE binary block per waveform.
+    Upgrade to true chunked SCPI transfer only with the full programmer manual.
+  * Exact command strings corroborated 2026-07-22 against the QCoDeS production driver
+    for this instrument (working code against real 5014C hardware; see
+    https://github.com/microsoft/Qcodes src/qcodes/instrument_drivers/tektronix/AWG5014.py):
+        WLISt:WAVeform:NEW "<name>",<size>,INTEGER
+        WLISt:WAVeform:DATA "<name>",#<ndigits><nbytes><binary LSB-first>
+        WLISt:WAVeform:DEL "<name>"   /   WLISt:WAVeform:DELete ALL
+        SOURce<n>:WAVeform "<name>"        (load from the waveform list into channel n)
+    Analog scaling follows the same driver: a in [-1, 1] -> DAC code round(8191 + 8191*a)
+    (integer format is the raw hardware word; the manual's REAL format is the normalized
+    ±1 representation, Table 2-26).
   * AWGControl:RSTate? returns 0=stopped, 1=waiting-for-trigger, 2=running (p. 2-39);
     qudi status ints are 0=stopped, 1=running, 2=waiting => mapping in get_status().
-  * [SOURce[n]]:FUNCtion:USER loads a waveform/sequence file into a channel (5000 series).
   * AWGControl:RMODe {CONTinuous|TRIGgered|GATed|SEQuence} (p. 2-37).
-  * MMEMory:IMPort supports type WFM (legacy AWG400-700 waveform format).
-The .wfm BINARY LAYOUT used here ('MAGIC 1000\\r\\n' + '#<ndigits><nbytes>' + per-sample
-[float32-LE analog, 1 marker byte with bit6=marker1, bit7=marker2] + 'CLOCK <rate>\\r\\n')
-is the family-standard layout (donor lineage + Tek docs); the layout page of the manual is
-NOT in the persisted extract => byte layout is TBC(REQ-028) and must be confirmed against
-the full manual before phase-C hardware upload. Validation in phase B is structure-level.
+
+PHASE-C VERIFICATION ITEMS (first instrument contact):
+  * After the first real transfer, drain SYSTem:ERRor? and verify the waveform appears
+    in the instrument's waveform list and outputs the expected shape on a scope.
+  * get_waveform_names() uses the LOCAL session record (the WLISt:NAME?/SIZE? query
+    syntax page is not in the extract) — switch to the instrument query at phase C.
+  * Whether *RST clears the instrument's user waveform list is unverified.
 
 Copyright (c) 2021, the qudi developers. See the AUTHORS.md file at the top-level directory
 of this distribution and on <https://github.com/Ulm-IQO/qudi-iqo-modules/>
@@ -58,11 +78,7 @@ You should have received a copy of the GNU Lesser General Public License along w
 If not, see <https://www.gnu.org/licenses/>.
 """
 
-import os
-import time
 from collections import OrderedDict
-from fnmatch import fnmatch
-from ftplib import FTP
 
 import numpy as np
 
@@ -73,7 +89,6 @@ except ImportError:
 
 from qudi.core.configoption import ConfigOption
 from qudi.util.helpers import natural_sort
-from qudi.util.paths import get_appdata_dir
 from qudi.interface.pulser_interface import PulserInterface, PulserConstraints, SequenceOption
 
 
@@ -84,52 +99,41 @@ class AWG5014C(PulserInterface):
         a_ch<n>  <->  markers d_ch<2n-1> (marker 1) and d_ch<2n> (marker 2)
         i.e. a_ch1: d_ch1/d_ch2, a_ch2: d_ch3/d_ch4, a_ch3: d_ch5/d_ch6, a_ch4: d_ch7/d_ch8
 
-    Example config for copy-paste (phase B — no ethernet, upload disabled):
+    Example config for copy-paste (waveform transfer runs over the GPIB/VISA link —
+    no ethernet required):
 
     pulser_awg5014c:
         module.Class: 'awg.tektronix_awg5014c.AWG5014C'
         options:
-            awg_visa_address: 'GPIB0::1::INSTR'   # to_be_confirmed (REQ-028 / front panel)
+            awg_visa_address: 'GPIB0::1::INSTR'   # probe-confirmed 2026-07-22 (REQ-028)
             timeout: 10                            # VISA timeout in seconds
-            # ftp_ip_address: '10.42.0.211'  # phase C: enables the FTP upload path
-            # ftp_root_dir: 'C:\\inetpub\\ftproot'
-            # ftp_login: 'anonymous'
-            # ftp_passwd: 'anonymous@'
-            # tmp_work_dir: 'C:\\Software\\qudi_pulsed_files'
-            # default_sample_rate: 600.0e6   # applied on activation ONLY if set
-            # --- provisional constraints, reconcile with device_models.md (REQ-028) ---
-            # sample_rate_max: 600.0e6
+            # default_sample_rate: 1.2e9   # applied on activation ONLY if set
+            # --- constraint overrides; defaults are SOURCED (device_models.md AWG5014C) ---
+            # sample_rate_min: 10.0e6
+            # sample_rate_max: 1.2e9
             # min_waveform_length: 250
-            # waveform_granularity: 4
-            # max_waveform_length: 4000000
+            # waveform_granularity: 1
+            # max_waveform_length: 32400000   # Opt 01 value; base unit: 16200000
     """
 
     # ---- transport config ----
     _visa_address = ConfigOption(name='awg_visa_address', missing='error')
     _visa_timeout = ConfigOption(name='timeout', default=10, missing='warn')  # seconds
-    # FTP upload path (donor architecture) — address parameterized; None = phase B, no upload
-    _ftp_ip_address = ConfigOption(name='ftp_ip_address', default=None, missing='nothing')
-    _ftp_root_dir = ConfigOption(name='ftp_root_dir', default='C:\\inetpub\\ftproot',
-                                 missing='nothing')
-    _username = ConfigOption(name='ftp_login', default='anonymous', missing='nothing')
-    _password = ConfigOption(name='ftp_passwd', default='anonymous@', missing='nothing')
-    _tmp_work_dir = ConfigOption(name='tmp_work_dir',
-                                 default=os.path.join(get_appdata_dir(True), 'pulsed_files'),
-                                 missing='warn')
     _default_sample_rate = ConfigOption(name='default_sample_rate', default=None,
                                         missing='nothing')
 
-    # ---- provisional device constraints — TBC(REQ-028), conservative defaults ----
+    # ---- device constraints — SOURCED defaults (REQ-028 answered 2026-07-22;
+    #      device_models.md AWG5014C / Tech Ref 077-0455-03), overridable per unit ----
     _cfg_sample_rate_min = ConfigOption(name='sample_rate_min', default=10.0e6,
-                                        missing='nothing')
-    _cfg_sample_rate_max = ConfigOption(name='sample_rate_max', default=600.0e6,
-                                        missing='nothing')
+                                        missing='nothing')   # Table 3
+    _cfg_sample_rate_max = ConfigOption(name='sample_rate_max', default=1.2e9,
+                                        missing='nothing')   # Table 3
     _cfg_min_wfm_length = ConfigOption(name='min_waveform_length', default=250,
-                                       missing='nothing')
-    _cfg_wfm_granularity = ConfigOption(name='waveform_granularity', default=4,
-                                        missing='nothing')
-    _cfg_max_wfm_length = ConfigOption(name='max_waveform_length', default=4_000_000,
-                                       missing='nothing')
+                                       missing='nothing')    # Table 2 (HW limit)
+    _cfg_wfm_granularity = ConfigOption(name='waveform_granularity', default=1,
+                                        missing='nothing')   # Table 2
+    _cfg_max_wfm_length = ConfigOption(name='max_waveform_length', default=32_400_000,
+                                       missing='nothing')    # Table 2, Opt 01 (this unit)
 
     # channel topology (structural: 4 analog channels, 2 markers each)
     __analog_channels = ('a_ch1', 'a_ch2', 'a_ch3', 'a_ch4')
@@ -141,10 +145,10 @@ class AWG5014C(PulserInterface):
         self._rm = None          # pyvisa ResourceManager (created on activation)
         self.awg = None          # pyvisa resource
         self.awg_model = ''      # from *IDN?
-        self.ftp_working_dir = 'waves'  # subfolder of the FTP root on the AWG disk
         self._loaded_assets = {}        # {int channel index: asset name} (internal tracking)
-        self._written_wfm_names = set()  # local record of waveforms written this session
-        self._wfm_open_handles = {}      # {wfm_name: open file handle} during chunked writes
+        self._written_wfm_names = set()  # local record of waveforms transferred this session
+        self._wfm_buffers = {}   # {wfm_name: [bytes, ...]} packed chunks awaiting transfer
+        self._wfm_totals = {}    # {wfm_name: expected total number of samples}
 
     # =========================================================================
     # Activation / deactivation
@@ -157,16 +161,12 @@ class AWG5014C(PulserInterface):
         no settings change — except sample rate IF 'default_sample_rate' is explicitly
         configured by the owner.
         """
-        # local work directory for generated .wfm files
-        if not os.path.exists(self._tmp_work_dir):
-            os.makedirs(os.path.abspath(self._tmp_work_dir))
-
         self._rm = visa.ResourceManager()
         if self._visa_address not in self._rm.list_resources():
             self.awg = None
             raise RuntimeError(
                 'VISA address "{0}" not found by the pyVISA resource manager. Check the GPIB '
-                'connection (NI MAX) and the address (REQ-028 / AWG front panel).'
+                'connection (NI MAX) and the address (connections.yaml devices.awg).'
                 ''.format(self._visa_address))
         self.awg = self._rm.open_resource(self._visa_address)
         self.awg.timeout = int(self._visa_timeout * 1000)  # pyvisa timeout is in ms
@@ -174,21 +174,18 @@ class AWG5014C(PulserInterface):
         idn = self.query('*IDN?')
         if 'AWG5014' not in idn.replace(' ', ''):
             self.log.warning('Unexpected *IDN? response (no "AWG5014"): "{0}". Wrong GPIB '
-                             'address? Proceeding, but check REQ-028.'.format(idn))
+                             'address? Proceeding, but check connections.yaml devices.awg.'
+                             ''.format(idn))
         parts = idn.split(',')
         self.awg_model = parts[1].strip() if len(parts) > 1 else idn
         self.log.info('Connected to: {0}'.format(idn))
-
-        if self._ftp_ip_address is None:
-            self.log.warning('No "ftp_ip_address" configured: waveform UPLOAD IS DISABLED '
-                             '(phase B — the AWG ethernet link is not set up; phase C item).')
 
         if self._default_sample_rate is not None:
             self.set_sample_rate(float(self._default_sample_rate))
 
     def on_deactivate(self):
-        """ Close the VISA connection. """
-        self._close_open_wfm_handles(discard=True)
+        """ Close the VISA connection; discard any half-buffered waveform chunks. """
+        self._discard_wfm_buffers()
         try:
             self.awg.close()
         except Exception:
@@ -202,17 +199,18 @@ class AWG5014C(PulserInterface):
     def get_constraints(self):
         """ Return the PulserConstraints for the AWG5014C.
 
-        PROVISIONAL (REQ-028 open): 5014C-specific limits come from the ConfigOptions
-        documented in the class docstring; donor-family values are marked TBC.
+        Defaults SOURCED (REQ-028 answered 2026-07-22): device_models.md AWG5014C entry,
+        from the Tektronix Technical Reference 077-0455-03 spec tables (in-repo extract).
+        The ConfigOptions allow per-unit overrides (e.g. a unit without Opt 01).
         """
         constraints = PulserConstraints()
 
-        constraints.sample_rate.min = float(self._cfg_sample_rate_min)   # TBC(REQ-028)
-        constraints.sample_rate.max = float(self._cfg_sample_rate_max)   # TBC(REQ-028)
-        constraints.sample_rate.step = 1.0e4
+        constraints.sample_rate.min = float(self._cfg_sample_rate_min)   # Table 3
+        constraints.sample_rate.max = float(self._cfg_sample_rate_max)   # Table 3
+        constraints.sample_rate.step = 10.0   # Table 3: 8-digit resolution (10 S/s at max)
         constraints.sample_rate.default = float(self._cfg_sample_rate_max)
 
-        # donor (AWG5000 family) analog levels — TBC(REQ-028)
+        # analog levels — Tech Ref Table 7 (per SE output into 50 ohm, Normal path)
         constraints.a_ch_amplitude.min = 0.02
         constraints.a_ch_amplitude.max = 4.5
         constraints.a_ch_amplitude.step = 0.001
@@ -223,7 +221,8 @@ class AWG5014C(PulserInterface):
         constraints.a_ch_offset.step = 0.001
         constraints.a_ch_offset.default = 0.0
 
-        # donor (AWG5000 family) marker levels — TBC(REQ-028)
+        # marker levels — Tech Ref Table 8 (window -1.0..+2.7 V into 50 ohm,
+        # amplitude 0.1..3.7 Vp-p, 10 mV resolution)
         constraints.d_ch_low.min = -1.0
         constraints.d_ch_low.max = 2.6
         constraints.d_ch_low.step = 0.01
@@ -234,23 +233,26 @@ class AWG5014C(PulserInterface):
         constraints.d_ch_high.step = 0.01
         constraints.d_ch_high.default = 2.7
 
-        constraints.waveform_length.min = int(self._cfg_min_wfm_length)   # TBC(REQ-028)
-        constraints.waveform_length.max = int(self._cfg_max_wfm_length)   # TBC(REQ-028)
-        constraints.waveform_length.step = int(self._cfg_wfm_granularity)  # TBC(REQ-028)
+        constraints.waveform_length.min = int(self._cfg_min_wfm_length)   # Table 2 (HW min)
+        constraints.waveform_length.max = int(self._cfg_max_wfm_length)   # Table 2 (Opt 01)
+        constraints.waveform_length.step = int(self._cfg_wfm_granularity)  # Table 2
         constraints.waveform_length.default = int(self._cfg_min_wfm_length)
 
+        # Tek docs disagree on the waveform-count limit (32,000 Tech Ref vs 16,200
+        # datasheet) — use the SAFE bound (device_models.md known_quirks).
         constraints.waveform_num.min = 1
-        constraints.waveform_num.max = 32000        # TBC(REQ-028)
+        constraints.waveform_num.max = 16_200
         constraints.waveform_num.step = 1
         constraints.waveform_num.default = 1
 
-        # Sequence mode is a NON-GOAL in phase B: advertise NO sequence capability so the
-        # sequence generator logic never routes sequences here. Phase D+ will lift this
+        # Sequence mode is a NON-GOAL in this phase: advertise NO sequence capability so
+        # the sequence generator logic never routes sequences here. Phase D+ lifts this
         # together with the sourced sequence-table limits from device_models.md.
         constraints.sequence_option = SequenceOption.NON
 
-        # trigger inputs (donor: 'A'/'B'; manual lists external trigger + event input)
-        constraints.event_triggers = ['A', 'B']     # TBC(REQ-028)
+        # The 5014C has ONE external Trigger In + ONE Event In (Tech Ref Tables 10/11) —
+        # no named 'A'/'B' triggers. Unused while sequence_option = NON; revisit phase D.
+        constraints.event_triggers = list()
         constraints.flags = list()
 
         activation_config = OrderedDict()
@@ -318,10 +320,10 @@ class AWG5014C(PulserInterface):
         constraints = self.get_constraints()
         sample_rate = float(sample_rate)
         if not (constraints.sample_rate.min <= sample_rate <= constraints.sample_rate.max):
-            self.log.error('Requested sample rate {0:.4g} Hz is outside the (provisional, '
-                           'REQ-028) allowed range [{1:.4g}, {2:.4g}] Hz. Command ignored.'
-                           ''.format(sample_rate, constraints.sample_rate.min,
-                                     constraints.sample_rate.max))
+            self.log.error('Requested sample rate {0:.4g} Hz is outside the allowed range '
+                           '[{1:.4g}, {2:.4g}] Hz (device_models.md AWG5014C). Command '
+                           'ignored.'.format(sample_rate, constraints.sample_rate.min,
+                                             constraints.sample_rate.max))
             return self.get_sample_rate()
         self.write('SOUR1:FREQ {0:.10e}'.format(sample_rate))
         self.query('*OPC?')
@@ -358,7 +360,7 @@ class AWG5014C(PulserInterface):
             constr = constraints.a_ch_amplitude
             if not (constr.min <= value <= constr.max):
                 self.log.warning('Amplitude {0} Vpp for {1} outside [{2}, {3}] Vpp '
-                                 '(provisional, REQ-028). Command ignored.'
+                                 '(Tech Ref Table 7). Command ignored.'
                                  ''.format(value, a_ch, constr.min, constr.max))
                 continue
             self.write('SOUR{0:d}:VOLT:AMPL {1}'.format(ch_num, value))
@@ -366,8 +368,8 @@ class AWG5014C(PulserInterface):
             ch_num = self._analog_ch_num(a_ch)
             constr = constraints.a_ch_offset
             if not (constr.min <= value <= constr.max):
-                self.log.warning('Offset {0} V for {1} outside [{2}, {3}] V (provisional, '
-                                 'REQ-028). Command ignored.'
+                self.log.warning('Offset {0} V for {1} outside [{2}, {3}] V (Tech Ref '
+                                 'Table 7). Command ignored.'
                                  ''.format(value, a_ch, constr.min, constr.max))
                 continue
             self.write('SOUR{0:d}:VOLT:OFFS {1}'.format(ch_num, value))
@@ -399,8 +401,8 @@ class AWG5014C(PulserInterface):
             src, mrk = self._marker_of(d_ch)
             constr = constraints.d_ch_low
             if not (constr.min <= value <= constr.max):
-                self.log.warning('Marker low {0} V for {1} outside [{2}, {3}] V (provisional, '
-                                 'REQ-028). Command ignored.'
+                self.log.warning('Marker low {0} V for {1} outside [{2}, {3}] V (Tech Ref '
+                                 'Table 8). Command ignored.'
                                  ''.format(value, d_ch, constr.min, constr.max))
                 continue
             self.write('SOUR{0:d}:MARK{1:d}:VOLT:LOW {2}'.format(src, mrk, value))
@@ -408,8 +410,8 @@ class AWG5014C(PulserInterface):
             src, mrk = self._marker_of(d_ch)
             constr = constraints.d_ch_high
             if not (constr.min <= value <= constr.max):
-                self.log.warning('Marker high {0} V for {1} outside [{2}, {3}] V (provisional, '
-                                 'REQ-028). Command ignored.'
+                self.log.warning('Marker high {0} V for {1} outside [{2}, {3}] V (Tech Ref '
+                                 'Table 8). Command ignored.'
                                  ''.format(value, d_ch, constr.min, constr.max))
                 continue
             self.write('SOUR{0:d}:MARK{1:d}:VOLT:HIGH {2}'.format(src, mrk, value))
@@ -469,13 +471,19 @@ class AWG5014C(PulserInterface):
 
     def write_waveform(self, name, analog_samples, digital_samples, is_first_chunk,
                        is_last_chunk, total_number_of_samples):
-        """ Write .wfm files (one per active analog channel) locally and upload them via FTP.
+        """ Pack samples into the sourced WLISt integer format (Table 2-25) and transfer
+        one waveform per active analog channel via WLISt:WAVeform:NEW/DATA.
 
-        ERROR CONTRACT (phase-B validated): illegal total length (below min, above max, or
-        violating the granularity) and unknown channel descriptors RAISE ValueError before
-        any byte is written — waveforms are never silently truncated or padded.
+        Qudi delivers samples in chunks; the packed words are BUFFERED locally and sent
+        to the instrument as ONE binary block on the last chunk (see module docstring —
+        avoids the unsourced chunked-DATA argument order). Nothing reaches the
+        instrument before the last chunk.
 
-        @return (int, list): samples written (-1 on failure) and created waveform names
+        ERROR CONTRACT (shakeout-validated): illegal total length (below min, above max,
+        or violating the granularity) and unknown channel descriptors RAISE ValueError
+        before any byte is buffered — waveforms are never silently truncated or padded.
+
+        @return (int, list): samples written this chunk (-1 on failure) and waveform names
         """
         waveforms = list()
 
@@ -493,27 +501,25 @@ class AWG5014C(PulserInterface):
                            'written per analog channel).')
             return -1, waveforms
 
-        # ---- validate total length ONCE, before any file is touched (raise: contract) ----
+        # ---- validate total length ONCE, before anything is buffered (raise: contract) ----
         if is_first_chunk:
             constraints = self.get_constraints()
             total = int(total_number_of_samples)
             if total < constraints.waveform_length.min:
-                msg = ('Waveform length {0:d} is below the minimum of {1:d} samples '
-                       '(provisional constraint, REQ-028).'
-                       ''.format(total, constraints.waveform_length.min))
+                msg = ('Waveform length {0:d} is below the hardware minimum of {1:d} samples '
+                       '(Tech Ref Table 2).'.format(total, constraints.waveform_length.min))
                 self.log.error('write_waveform: ' + msg)
                 raise ValueError(msg)
             if total > constraints.waveform_length.max:
                 msg = ('Waveform length {0:d} exceeds the maximum of {1:d} samples '
-                       '(provisional constraint, REQ-028).'
+                       '(Tech Ref Table 2, Opt 01).'
                        ''.format(total, constraints.waveform_length.max))
                 self.log.error('write_waveform: ' + msg)
                 raise ValueError(msg)
             granularity = constraints.waveform_length.step
             if total % granularity != 0:
-                msg = ('Waveform length {0:d} violates the length granularity {1:d} '
-                       '(provisional constraint, REQ-028). Refusing to truncate/pad.'
-                       ''.format(total, granularity))
+                msg = ('Waveform length {0:d} violates the length granularity {1:d}. '
+                       'Refusing to truncate/pad.'.format(total, granularity))
                 self.log.error('write_waveform: ' + msg)
                 raise ValueError(msg)
 
@@ -522,6 +528,7 @@ class AWG5014C(PulserInterface):
         for chnl, samples in list(analog_samples.items()) + list(digital_samples.items()):
             if len(samples) != chunk_length:
                 self.log.error('write_waveform: unequal sample array lengths across channels.')
+                self._discard_wfm_buffers(prefix=name)
                 return -1, waveforms
 
         # ---- congruence with channel activation (awg70k pattern, analog channels) ----
@@ -531,37 +538,26 @@ class AWG5014C(PulserInterface):
             self.log.error('write_waveform: mismatch between active analog channels {0} and '
                            'provided sample arrays {1}.'
                            ''.format(active_analog, sorted(analog_samples)))
+            self._discard_wfm_buffers(prefix=name)
             return -1, waveforms
 
-        # ---- write one .wfm per analog channel ----
-        sample_rate = self.get_sample_rate()
+        # ---- pack + buffer this chunk; transfer on the last chunk ----
         for a_ch in active_analog:
             a_ch_num = self._analog_ch_num(a_ch)
             wfm_name = '{0}_ch{1:d}'.format(name, a_ch_num)
 
-            mrk1 = 'd_ch{0:d}'.format(2 * a_ch_num - 1)
-            mrk2 = 'd_ch{0:d}'.format(2 * a_ch_num)
-            # marker byte: bit 6 = marker 1, bit 7 = marker 2 (family layout, TBC REQ-028)
-            marker_bytes = np.zeros(chunk_length, dtype=np.uint8)
-            if mrk1 in digital_samples:
-                np.add(marker_bytes,
-                       np.left_shift(digital_samples[mrk1].astype(np.uint8), 6),
-                       out=marker_bytes)
-            if mrk2 in digital_samples:
-                np.add(marker_bytes,
-                       np.left_shift(digital_samples[mrk2].astype(np.uint8), 7),
-                       out=marker_bytes)
-
-            self._write_wfm_chunk(wfm_name=wfm_name,
-                                  analog_chunk=analog_samples[a_ch],
-                                  marker_bytes=marker_bytes,
-                                  is_first_chunk=is_first_chunk,
-                                  is_last_chunk=is_last_chunk,
-                                  total_number_of_samples=int(total_number_of_samples),
-                                  sample_rate=sample_rate)
+            mrk1 = 'd_ch{0:d}'.format(2 * a_ch_num - 1)   # marker 1 = bit 14 (Table 2-25)
+            mrk2 = 'd_ch{0:d}'.format(2 * a_ch_num)       # marker 2 = bit 15 (Table 2-25)
+            words = self._pack_samples(analog_samples[a_ch],
+                                       digital_samples.get(mrk1),
+                                       digital_samples.get(mrk2))
+            if is_first_chunk:
+                self._wfm_buffers[wfm_name] = []
+                self._wfm_totals[wfm_name] = int(total_number_of_samples)
+            self._wfm_buffers[wfm_name].append(words.tobytes())
 
             if is_last_chunk:
-                self._send_file(wfm_name + '.wfm')
+                self._transfer_waveform(wfm_name)
                 self._written_wfm_names.add(wfm_name)
             waveforms.append(wfm_name)
 
@@ -570,51 +566,44 @@ class AWG5014C(PulserInterface):
         return chunk_length, waveforms
 
     def write_sequence(self, name, sequence_parameters):
-        """ NOT AVAILABLE in phase B (non-goal; sequence_option = NON).  @return int: -1 """
-        self.log.error('Sequence mode is not implemented in the phase-B AWG5014C module '
-                       '(non-goal; planned phase D+, gated on REQ-028 sequence-table limits).')
+        """ NOT AVAILABLE in this phase (non-goal; sequence_option = NON).  @return int: -1 """
+        self.log.error('Sequence mode is not implemented in this AWG5014C module '
+                       '(non-goal; planned phase D+ with the sourced sequence-table limits).')
         return -1
 
     def get_waveform_names(self):
-        """ Waveform files (*.wfm, stripped extension) in the AWG's FTP waveform directory.
-        Without a configured FTP address (phase B) falls back to the local session record. """
-        if self._ftp_ip_address is None:
-            return natural_sort(self._written_wfm_names)
-        names = []
-        for filename in self._get_filenames_on_device():
-            if filename.endswith('.wfm'):
-                names.append(filename[:-4])
-        return natural_sort(set(names))
+        """ Waveform names transferred THIS SESSION (local record).
+
+        The instrument-side list query (WLISt:SIZE? / WLISt:NAME?) is not wired up yet —
+        its argument syntax page is missing from the in-repo manual extract. Switching
+        to the instrument query is a phase-C item (module docstring).
+        """
+        return natural_sort(self._written_wfm_names)
 
     def get_sequence_names(self):
-        """ Sequence mode is a phase-B non-goal.  @return list: empty """
+        """ Sequence mode is a non-goal this phase.  @return list: empty """
         return list()
 
     def delete_waveform(self, waveform_name):
-        """ Delete waveform file(s) from the AWG's FTP waveform directory.
+        """ Delete waveform(s) from the instrument's waveform list (WLISt:WAVeform:DEL).
         @return list: deleted waveform names """
         if isinstance(waveform_name, str):
             waveform_name = [waveform_name]
         avail = self.get_waveform_names()
         to_delete = [wfm for wfm in waveform_name if wfm in avail]
-        if self._ftp_ip_address is None:
-            self._written_wfm_names.difference_update(to_delete)
-            return to_delete
-        with FTP(self._ftp_ip_address) as ftp:
-            ftp.login(user=self._username, passwd=self._password)
-            ftp.cwd(self.ftp_working_dir)
-            for wfm in to_delete:
-                ftp.delete(wfm + '.wfm')
+        for wfm in to_delete:
+            self.write('WLIS:WAV:DEL "{0}"'.format(wfm))
         self._written_wfm_names.difference_update(to_delete)
         return to_delete
 
     def delete_sequence(self, sequence_name):
-        """ Sequence mode is a phase-B non-goal.  @return list: empty """
+        """ Sequence mode is a non-goal this phase.  @return list: empty """
         return list()
 
     def load_waveform(self, load_dict):
-        """ Load written .wfm files into channels via [SOURce[n]]:FUNCtion:USER
-        (AWG5000-series command, programmer manual 077006105).
+        """ Load waveforms from the instrument waveform list into channels via
+        SOURce<n>:WAVeform (programmer manual p. 2-23 "how to load a waveform into
+        hardware memory"; exact string corroborated by the QCoDeS driver).
 
         @param dict|list load_dict: {channel index: waveform name} or list of names with
                                     '_ch<n>' suffixes (see interface docstring)
@@ -635,7 +624,7 @@ class AWG5014C(PulserInterface):
             raise ValueError('Invalid AWG5014C channel index(es): {0} (valid: 1..4).'
                              ''.format(invalid))
 
-        # all waveforms must exist on the device (or local record in phase B)
+        # all waveforms must exist in the (session-local) waveform record
         avail = self.get_waveform_names()
         missing = [wfm for wfm in load_dict.values() if wfm not in avail]
         if missing:
@@ -643,31 +632,31 @@ class AWG5014C(PulserInterface):
                            ''.format(missing))
             return self.get_loaded_assets()[0]
 
-        path = self._ftp_root_dir + '\\' + self.ftp_working_dir
         for ch_num, wfm in load_dict.items():
-            self.write('SOUR{0:d}:FUNC:USER "{1}/{2}"'.format(ch_num, path, wfm + '.wfm'))
+            self.write('SOUR{0:d}:WAV "{1}"'.format(ch_num, wfm))
             self._loaded_assets[ch_num] = wfm
         self.query('*OPC?')
         return self.get_loaded_assets()[0]
 
     def load_sequence(self, sequence_name):
-        """ NOT AVAILABLE in phase B (non-goal).  @return dict: currently loaded assets """
-        self.log.error('Sequence mode is not implemented in the phase-B AWG5014C module '
+        """ NOT AVAILABLE in this phase (non-goal).  @return dict: currently loaded assets """
+        self.log.error('Sequence mode is not implemented in this AWG5014C module '
                        '(non-goal; planned phase D+).')
         return self.get_loaded_assets()[0]
 
     def get_loaded_assets(self):
-        """ Internally tracked channel->asset map (phase B; cross-check against
-        SOUR<n>:FUNC:USER? readback is a phase-C hardware-validation item).
+        """ Internally tracked channel->asset map (cross-check against SOUR<n>:WAVeform?
+        readback is a phase-C hardware-validation item).
 
         @return (dict, str): {channel index: asset name}, 'waveform' (sequences: phase D+)
         """
         return dict(self._loaded_assets), 'waveform'
 
     def clear_all(self):
-        """ Delete all waveforms from the AWG waveform list and forget loaded assets.
+        """ Delete all waveforms from the AWG waveform list and forget local bookkeeping.
         @return int: error code (0: OK) """
         self.write('WLIS:WAV:DEL ALL')
+        self._written_wfm_names = set()
         self._loaded_assets = {}
         return 0
 
@@ -687,11 +676,16 @@ class AWG5014C(PulserInterface):
         return False
 
     def reset(self):
-        """ *RST and clear the internal asset bookkeeping.  @return int: 0 """
+        """ *RST and clear the internal asset bookkeeping.  @return int: 0
+
+        NOTE: whether *RST clears the instrument's user waveform list is unverified
+        (phase-C item) — the local waveform record is deliberately KEPT here, matching
+        the previous behavior; clear_all() is the explicit wipe.
+        """
         self.write('*RST')
         self.query('*OPC?')
         self._loaded_assets = {}
-        self._close_open_wfm_handles(discard=True)
+        self._discard_wfm_buffers()
         return 0
 
     # =========================================================================
@@ -705,6 +699,11 @@ class AWG5014C(PulserInterface):
     def write(self, command):
         """ Write a command to the device.  @return int: 0 """
         self.awg.write(command)
+        return 0
+
+    def write_raw(self, message_bytes):
+        """ Write a raw bytes message (binary block transfers).  @return int: 0 """
+        self.awg.write_raw(message_bytes)
         return 0
 
     # =========================================================================
@@ -726,84 +725,58 @@ class AWG5014C(PulserInterface):
         k = int(d_ch.rsplit('ch', 1)[1])
         return (k + 1) // 2, 2 - (k % 2)
 
-    def _write_wfm_chunk(self, wfm_name, analog_chunk, marker_bytes, is_first_chunk,
-                         is_last_chunk, total_number_of_samples, sample_rate):
-        """ Append one chunk to <tmp_work_dir>/<wfm_name>.wfm in the family-standard layout:
+    @staticmethod
+    def _pack_samples(analog_chunk, marker1=None, marker2=None):
+        """ Pack one chunk into the SOURCED integer waveform format:
 
-            b'MAGIC 1000\\r\\n'
-            b'#' + <ndigits> + <nbytes>          (nbytes = 5 * total_number_of_samples)
-            total_number_of_samples * [ <float32-LE analog in [-1, 1]> + <1 marker byte> ]
-            b'CLOCK <rate as %16.10E>\\r\\n'
+        Programmer Manual 077-0061-05 Table 2-25 (in-repo extract): 2 bytes/point,
+        LSB-first ('<u2'), bit layout M2 M1 D13..D0. Analog scaling (QCoDeS-corroborated,
+        module docstring): a in [-1, 1] -> DAC code round(8191 + 8191*a), i.e. 0..16382
+        symmetric about mid-code 8191. Marker 1 = bit 14, marker 2 = bit 15.
 
-        Byte layout TBC(REQ-028) against the full programmer manual before phase-C upload.
+        @return numpy.ndarray dtype '<u2': packed sample words
         """
-        filepath = os.path.join(self._tmp_work_dir, wfm_name + '.wfm')
-        if is_first_chunk:
-            wfm_file = open(filepath, 'wb')
-            self._wfm_open_handles[wfm_name] = wfm_file
-            num_bytes = str(int(total_number_of_samples * 5))
-            header = b'MAGIC 1000\r\n' + b'#' + str(len(num_bytes)).encode() \
-                     + num_bytes.encode()
-            wfm_file.write(header)
-        else:
-            wfm_file = self._wfm_open_handles[wfm_name]
+        a = np.clip(np.asarray(analog_chunk, dtype=np.float64), -1.0, 1.0)
+        words = np.round(8191.0 + 8191.0 * a).astype('<u2')
+        if marker1 is not None:
+            words |= np.asarray(marker1).astype(bool).astype('<u2') << np.uint16(14)
+        if marker2 is not None:
+            words |= np.asarray(marker2).astype(bool).astype('<u2') << np.uint16(15)
+        return words
 
-        # interleave float32-LE analog samples with the marker bytes (5 bytes per sample)
-        interleaved = np.zeros(len(analog_chunk),
-                               dtype=np.dtype([('a', '<f4'), ('m', 'u1')]))
-        interleaved['a'] = np.asarray(analog_chunk, dtype='<f4')
-        interleaved['m'] = marker_bytes
-        wfm_file.write(interleaved.tobytes())
+    def _transfer_waveform(self, wfm_name):
+        """ Send one fully buffered waveform to the instrument:
 
-        if is_last_chunk:
-            wfm_file.write('CLOCK {0:16.10E}\r\n'.format(sample_rate).encode())
-            wfm_file.close()
-            del self._wfm_open_handles[wfm_name]
+            WLISt:WAVeform:DEL "<name>"                     (overwrite-safe; no-op if absent)
+            WLISt:WAVeform:NEW "<name>",<size>,INTEGER
+            WLISt:WAVeform:DATA "<name>",#<nd><nbytes><payload LSB-first>
 
-    def _close_open_wfm_handles(self, discard=False):
-        """ Close (and optionally delete) any half-written .wfm files. """
-        for wfm_name, handle in list(self._wfm_open_handles.items()):
-            try:
-                handle.close()
-            except Exception:
-                pass
-            if discard:
-                try:
-                    os.remove(os.path.join(self._tmp_work_dir, wfm_name + '.wfm'))
-                except OSError:
-                    pass
-            del self._wfm_open_handles[wfm_name]
+        Raises ValueError if the accumulated chunk bytes do not add up to the announced
+        total_number_of_samples (refuse to send a corrupt waveform).
+        """
+        payload = b''.join(self._wfm_buffers.pop(wfm_name))
+        total = self._wfm_totals.pop(wfm_name)
+        n_points = len(payload) // 2
+        if n_points != total:
+            msg = ('Buffered chunks for waveform "{0}" hold {1:d} samples but '
+                   '{2:d} were announced — refusing to transfer a corrupt waveform.'
+                   ''.format(wfm_name, n_points, total))
+            self.log.error('_transfer_waveform: ' + msg)
+            raise ValueError(msg)
+        self.write('WLIS:WAV:DEL "{0}"'.format(wfm_name))
+        self.write('WLIS:WAV:NEW "{0}",{1:d},INTEGER'.format(wfm_name, n_points))
+        nbytes = str(len(payload))
+        header = 'WLIS:WAV:DATA "{0}",#{1:d}{2}'.format(wfm_name, len(nbytes), nbytes)
+        self.write_raw(header.encode('ascii') + payload)
+        self.query('*OPC?')
 
-    def _send_file(self, filename):
-        """ Upload a file from tmp_work_dir to the AWG waveform directory via FTP (donor
-        path). Without a configured FTP address (phase B) this raises RuntimeError. """
-        if self._ftp_ip_address is None:
-            raise RuntimeError(
-                'FTP upload requested but no "ftp_ip_address" is configured. The AWG5014C '
-                'ethernet link is not set up (phase C, connections.yaml to_be_confirmed) — '
-                'refusing to pretend the upload happened.')
-        filepath = os.path.join(self._tmp_work_dir, filename)
-        with FTP(self._ftp_ip_address) as ftp:
-            ftp.login(user=self._username, passwd=self._password)
-            ftp.cwd(self.ftp_working_dir)
-            with open(filepath, 'rb') as file_handle:
-                ftp.storbinary('STOR ' + filename, file_handle)
-
-    def _get_filenames_on_device(self):
-        """ File names in the AWG's FTP waveform directory (donor's listing parser). """
-        filename_list = []
-        with FTP(self._ftp_ip_address) as ftp:
-            ftp.login(user=self._username, passwd=self._password)
-            ftp.cwd(self.ftp_working_dir)
-            log_lines = []
-            ftp.retrlines('LIST', callback=log_lines.append)
-            for line in log_lines:
-                if '<DIR>' in line:
-                    continue
-                # e.g. '05-10-16  05:22PM        292 SSR aom adjusted.seq' (donor comment)
-                size_and_name = line[18:].lstrip()
-                actual_filename = size_and_name.split(' ', 1)[1].lstrip()
-                if fnmatch(actual_filename, '*.wfm') or fnmatch(actual_filename, '*.seq'):
-                    if actual_filename not in filename_list:
-                        filename_list.append(actual_filename)
-        return filename_list
+    def _discard_wfm_buffers(self, prefix=None):
+        """ Drop buffered (untransferred) waveform chunks — all of them, or only those of
+        one ensemble name ('<prefix>_ch<n>'). """
+        if prefix is None:
+            self._wfm_buffers = {}
+            self._wfm_totals = {}
+            return
+        for key in [k for k in self._wfm_buffers if k.startswith(prefix + '_ch')]:
+            del self._wfm_buffers[key]
+            self._wfm_totals.pop(key, None)
