@@ -49,8 +49,9 @@ sees STEADY illumination — a blink between lines re-triggers the bleaching tra
 (cycle-1 lesson, progress 2026-07-02/03). A manual laser_on() is likewise preserved across
 frames and restored at teardown. Call laser_off() to stop the light.
 
-SAFETY: activation performs NO RF and NO motion; RF power is capped upstream (SAFE-001,
-power_max -7 dBm in the SMIQ config) and RF-ON is a human action (amp PSU). If this module
+SAFETY: activation performs NO RF and NO motion; RF power is capped upstream (SAFE-004,
+power_max -10 dBm in the SMIQ config — supersedes SAFE-001/-7 dBm since the 2026-07-14 amp
+swap to the ZHL-16W-43-S+) and RF-ON is a human action (amp PSU). If this module
 owns the Pulse Streamer it sets all outputs LOW on activation.
 
 Example config (see Qudi_AI/setups/confocal_odmr/qudi_config_confocal_odmr.cfg):
