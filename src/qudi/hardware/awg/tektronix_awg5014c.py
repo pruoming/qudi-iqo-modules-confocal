@@ -149,6 +149,9 @@ class AWG5014C(PulserInterface):
         self._written_wfm_names = set()  # local record of waveforms transferred this session
         self._wfm_buffers = {}   # {wfm_name: [bytes, ...]} packed chunks awaiting transfer
         self._wfm_totals = {}    # {wfm_name: expected total number of samples}
+        self._intended_outputs = {1: False, 2: False, 3: False, 4: False}  # AWG-002 (see
+        # get_active_channels): selected analog-output states; applied to OUTP<n>:STAT
+        # only when legal (waveform loaded), synced FROM the instrument at activation
 
     # =========================================================================
     # Activation / deactivation
@@ -162,13 +165,25 @@ class AWG5014C(PulserInterface):
         configured by the owner.
         """
         self._rm = visa.ResourceManager()
-        if self._visa_address not in self._rm.list_resources():
+        # Open DIRECTLY — do not pre-check against list_resources(): pyvisa/NI-VISA does
+        # not enumerate TCPIP resources, so a list-membership guard falsely rejects every
+        # valid TCPIP address (AWG-001, found at phase-C first light 2026-07-22; the
+        # donor's guard was GPIB-only thinking).
+        try:
+            self.awg = self._rm.open_resource(self._visa_address)
+        except Exception as err:
             self.awg = None
+            try:
+                listed = self._rm.list_resources()
+            except Exception:
+                listed = ('<list_resources() itself failed>',)
             raise RuntimeError(
-                'VISA address "{0}" not found by the pyVISA resource manager. Check the GPIB '
-                'connection (NI MAX) and the address (connections.yaml devices.awg).'
-                ''.format(self._visa_address))
-        self.awg = self._rm.open_resource(self._visa_address)
+                'Could not open VISA resource "{0}" ({1}). GPIB: check NI MAX + address. '
+                'TCPIP: ping the AWG (169.254.8.20) and remember SCPI answers only after '
+                'the embedded Windows has fully booted (minutes after power-on). '
+                'Resources the manager CAN enumerate (TCPIP is normally NOT in this list '
+                '— that is expected): {2}. See connections.yaml devices.awg.'
+                ''.format(self._visa_address, err, listed)) from err
         self.awg.timeout = int(self._visa_timeout * 1000)  # pyvisa timeout is in ms
 
         idn = self.query('*IDN?')
@@ -179,6 +194,14 @@ class AWG5014C(PulserInterface):
         parts = idn.split(',')
         self.awg_model = parts[1].strip() if len(parts) > 1 else idn
         self.log.info('Connected to: {0}'.format(idn))
+
+        # Sync the intended-output bookkeeping FROM the instrument (read-only queries;
+        # AWG-002 — see get_active_channels).
+        for n in (1, 2, 3, 4):
+            try:
+                self._intended_outputs[n] = bool(int(self.query('OUTP{0:d}:STAT?'.format(n))))
+            except Exception:
+                self._intended_outputs[n] = False
 
         if self._default_sample_rate is not None:
             self.set_sample_rate(float(self._default_sample_rate))
@@ -278,7 +301,20 @@ class AWG5014C(PulserInterface):
     # =========================================================================
 
     def pulser_on(self):
-        """ Start waveform output.  @return int: qudi status (see get_status) """
+        """ Start waveform output.  @return int: qudi status (see get_status)
+
+        Defensively re-applies the intended output states first (AWG-002): ON only for
+        channels that have a loaded waveform; an intended-ON channel WITHOUT one is a
+        real problem at this point and is logged as an error.
+        """
+        for ch_num, intended in sorted(self._intended_outputs.items()):
+            if intended:
+                if self._loaded_assets.get(ch_num):
+                    self.write('OUTP{0:d}:STAT ON'.format(ch_num))
+                else:
+                    self.log.error('pulser_on: channel {0:d} is selected active but has no '
+                                   'waveform loaded — the 5014C cannot enable it (AWG-002). '
+                                   'Load an asset first.'.format(ch_num))
         self.write('AWGC:RUN')
         return self.get_status()[0]
 
@@ -422,41 +458,54 @@ class AWG5014C(PulserInterface):
     # =========================================================================
 
     def get_active_channels(self, ch=None):
-        """ Active channels. Analog: OUTPut<n>:STATe?. Markers: the AWG5000 series runs at
-        fixed 14-bit DAC resolution, so markers are always available — a marker is reported
-        active iff its parent analog channel output is on (donor behavior refined). """
+        """ Active channels = the SELECTED (intended) analog-output states; markers follow
+        their parent analog channel (fixed 14-bit DAC — markers are always available).
+
+        DELIBERATE DEVIATION (AWG-002, measured 2026-07-22): this reports the module's
+        intended selection, NOT a live OUTPut<n>:STATe? readback. The 5014C REFUSES
+        'OUTP<n>:STAT ON' while the channel has no waveform loaded (SYST:ERR
+        5000,"Sequence/Waveform loading error; E11203"), but qudi's
+        sequence_generator_logic applies the activation config at LOGIC activation —
+        before any waveform exists — and verifies it by an immediate readback, so an
+        honest hardware readback can never satisfy it. The intent is recorded here and
+        applied to the hardware as soon as it is legal (load_waveform) and defensively at
+        pulser_on(); it is synced FROM the hardware at activation and reset().
+        """
         if ch is None:
             ch = list(self.__analog_channels) + list(self.__digital_channels)
         active_ch = {}
-        analog_state_cache = {}
         for channel in ch:
             if channel in self.__analog_channels:
-                ch_num = self._analog_ch_num(channel)
-                if ch_num not in analog_state_cache:
-                    analog_state_cache[ch_num] = bool(
-                        int(self.query('OUTP{0:d}:STAT?'.format(ch_num))))
-                active_ch[channel] = analog_state_cache[ch_num]
+                active_ch[channel] = self._intended_outputs[self._analog_ch_num(channel)]
             elif channel in self.__digital_channels:
                 src, _ = self._marker_of(channel)
-                if src not in analog_state_cache:
-                    analog_state_cache[src] = bool(
-                        int(self.query('OUTP{0:d}:STAT?'.format(src))))
-                active_ch[channel] = analog_state_cache[src]
+                active_ch[channel] = self._intended_outputs[src]
             else:
                 raise ValueError('Unknown channel descriptor "{0}" for AWG5014C (valid: '
                                  'a_ch1..a_ch4, d_ch1..d_ch8).'.format(channel))
         return active_ch
 
     def set_active_channels(self, ch=None):
-        """ Set analog outputs on/off (OUTPut<n>:STATe). Marker entries are accepted but the
-        AWG5000 series cannot deactivate markers independently (fixed 14-bit DAC) — they
-        follow their parent analog channel; mismatching marker requests are logged. """
+        """ Select analog outputs on/off. OFF is applied to OUTPut<n>:STATe immediately
+        (always legal); ON is applied immediately only if the channel already has a
+        waveform loaded, otherwise it is DEFERRED until load_waveform()/pulser_on()
+        (AWG-002 — the instrument refuses ON without a waveform; see
+        get_active_channels). Marker entries are accepted but ignored: the AWG5000
+        series cannot deactivate markers independently — they follow their parent
+        analog channel. """
         if ch is None:
             ch = {}
         for channel, state in ch.items():
             if channel in self.__analog_channels:
                 ch_num = self._analog_ch_num(channel)
-                self.write('OUTP{0:d}:STAT {1}'.format(ch_num, 'ON' if state else 'OFF'))
+                self._intended_outputs[ch_num] = bool(state)
+                if not state:
+                    self.write('OUTP{0:d}:STAT OFF'.format(ch_num))
+                elif self._loaded_assets.get(ch_num):
+                    self.write('OUTP{0:d}:STAT ON'.format(ch_num))
+                else:
+                    self.log.debug('OUTP{0:d} ON deferred until a waveform is loaded '
+                                   '(AWG-002).'.format(ch_num))
             elif channel in self.__digital_channels:
                 self.log.debug('Marker channel {0} activation follows its parent analog '
                                'channel on the AWG5000 series; entry ignored.'.format(channel))
@@ -503,6 +552,15 @@ class AWG5014C(PulserInterface):
 
         # ---- validate total length ONCE, before anything is buffered (raise: contract) ----
         if is_first_chunk:
+            # AWG-003 guard: rewriting/deleting list waveforms while the instrument is
+            # running is the suspected killer of the LXI session (VI_ERROR_CONN_LOST
+            # during a re-sample, 2026-07-22). Refuse loudly; the user stops the pulser
+            # first. (get_status -1 = comms failure also refuses — correct either way.)
+            if self.get_status()[0] != 0:
+                msg = ('write_waveform: the AWG is running (or unreachable) — stop the '
+                       'pulser before sampling/rewriting waveforms (AWG-003).')
+                self.log.error(msg)
+                raise RuntimeError(msg)
             constraints = self.get_constraints()
             total = int(total_number_of_samples)
             if total < constraints.waveform_length.min:
@@ -589,6 +647,13 @@ class AWG5014C(PulserInterface):
         @return list: deleted waveform names """
         if isinstance(waveform_name, str):
             waveform_name = [waveform_name]
+        # AWG-003 guard (see write_waveform): no list deletions while running. This path
+        # is called from cleanup code, so it refuses WITHOUT raising.
+        if self.get_status()[0] != 0:
+            self.log.error('delete_waveform: the AWG is running (or unreachable) — '
+                           'refusing to delete list waveforms (AWG-003). Stop the pulser '
+                           'first. Nothing deleted.')
+            return list()
         avail = self.get_waveform_names()
         to_delete = [wfm for wfm in waveform_name if wfm in avail]
         for wfm in to_delete:
@@ -636,6 +701,12 @@ class AWG5014C(PulserInterface):
             self.write('SOUR{0:d}:WAV "{1}"'.format(ch_num, wfm))
             self._loaded_assets[ch_num] = wfm
         self.query('*OPC?')
+        # Apply DEFERRED output-enable intents now that these channels have waveforms
+        # (AWG-002 — ON was illegal before the load).
+        for ch_num in load_dict:
+            if self._intended_outputs.get(ch_num):
+                self.write('OUTP{0:d}:STAT ON'.format(ch_num))
+        self.query('*OPC?')
         return self.get_loaded_assets()[0]
 
     def load_sequence(self, sequence_name):
@@ -654,7 +725,11 @@ class AWG5014C(PulserInterface):
 
     def clear_all(self):
         """ Delete all waveforms from the AWG waveform list and forget local bookkeeping.
-        @return int: error code (0: OK) """
+        @return int: error code (0: OK, -1: refused while running — AWG-003) """
+        if self.get_status()[0] != 0:
+            self.log.error('clear_all: the AWG is running (or unreachable) — refusing '
+                           'WLIS:WAV:DEL ALL (AWG-003). Stop the pulser first.')
+            return -1
         self.write('WLIS:WAV:DEL ALL')
         self._written_wfm_names = set()
         self._loaded_assets = {}
@@ -686,6 +761,13 @@ class AWG5014C(PulserInterface):
         self.query('*OPC?')
         self._loaded_assets = {}
         self._discard_wfm_buffers()
+        # Re-sync the intended-output bookkeeping from the instrument (AWG-002): *RST
+        # returns outputs to their reset state — do not keep stale intents.
+        for n in (1, 2, 3, 4):
+            try:
+                self._intended_outputs[n] = bool(int(self.query('OUTP{0:d}:STAT?'.format(n))))
+            except Exception:
+                self._intended_outputs[n] = False
         return 0
 
     # =========================================================================
