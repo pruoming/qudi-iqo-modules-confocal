@@ -53,9 +53,12 @@ CARRIED-OVER LESSONS (known_issues IDs, from the 5014C bring-up):
     deletes are not needed mid-run, and the 5014C died in exactly that corner.)
 
 PHASE-C VERIFICATION ITEMS (first instrument contact):
-  * FILE NAME LENGTH: floppy-era instrument — whether internal file names longer than
-    DOS 8.3 are accepted is UNSOURCED. Test 'sincos_ens_ch1.WFM' (14+4 chars) EARLY; if
-    refused, a name-shortening map must be added.
+  * FILE NAME LENGTH — MEASURED 2026-07-24 (AWG-006): names longer than 8+3 are
+    REJECTED with event 257 "File name error; file name too long", and a CURVe sent
+    after such a failed DATA:DESTination WEDGES the GPIB bus (the AWG-005 symptom).
+    FIX built in: qudi waveform names are mapped to 8.3-safe instrument file names
+    (_file_name_for; uppercase, [A-Z0-9_-], body <= 8 chars, collision counter);
+    qudi-facing names (get_waveform_names/load/delete) stay the full names.
   * OUTPut ON without waveform: record accept/refuse (AWG-002 pattern above).
   * Whether *RST clears the internal-memory user files is unverified (reset() keeps the
     local record, matching the 5014C policy; clear_all() is the explicit wipe).
@@ -80,6 +83,7 @@ You should have received a copy of the GNU Lesser General Public License along w
 If not, see <https://www.gnu.org/licenses/>.
 """
 
+import time
 from collections import OrderedDict
 
 import numpy as np
@@ -91,7 +95,16 @@ except ImportError:
 
 from qudi.core.configoption import ConfigOption
 from qudi.util.helpers import natural_sort
+from qudi.util.mutex import RecursiveMutex
 from qudi.interface.pulser_interface import PulserInterface, PulserConstraints, SequenceOption
+
+
+class _BusWedgeRecovered(RuntimeError):
+    """ Internal signal (AWG-009): the bus wedged after a binary block and a GPIB
+    Selected Device Clear brought it back — the enclosing transfer should be retried.
+    SDC recovery was MEASURED on a live wedge 2026-07-24 (console clear() -> *ESR? '0'
+    with no power-cycle). """
+    pass
 
 
 class AWG2041(PulserInterface):
@@ -137,6 +150,10 @@ class AWG2041(PulserInterface):
     __analog_channels = ('a_ch1',)
     __digital_channels = ('d_ch1', 'd_ch2')
 
+    # Post-block poll budget in seconds (class attribute for shakeout testability;
+    # AWG-007/009). Transfers that exceed it trigger the Device-Clear recovery.
+    _post_block_timeout_s = 30
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._rm = None          # pyvisa ResourceManager (created on activation)
@@ -147,6 +164,16 @@ class AWG2041(PulserInterface):
         self._wfm_buffers = {}   # {wfm_name: {'a': [bytes,...], 'm': [bytes,...]}}
         self._wfm_totals = {}    # {wfm_name: expected total number of samples}
         self._intended_outputs = {1: False}  # AWG-002 pattern (see get_active_channels)
+        self._file_names = {}    # {qudi wfm name: 8.3-safe instrument file body} (AWG-006)
+        # AWG-008: ALL VISA traffic is serialized by this lock. Qudi is multi-threaded
+        # (the pulsed logic polls pulser status on a timer); an unsynchronized query
+        # landing inside a transfer sequence hands this instrument a new message while
+        # its previous response is pending (its manual's event 420 "Query
+        # INTERRUPTED/UNTERMINATED" territory) — consistent with the randomly-located
+        # bus wedges seen ONLY inside qudi (2026-07-24) while every single-threaded
+        # probe passes. The lock is recursive: multi-command sequences hold it across
+        # their whole critical section.
+        self._comm_lock = RecursiveMutex()
 
     # =========================================================================
     # Activation / deactivation
@@ -604,7 +631,8 @@ class AWG2041(PulserInterface):
         avail = self.get_waveform_names()
         to_delete = [wfm for wfm in waveform_name if wfm in avail]
         for wfm in to_delete:
-            self.write('MEMory:DELete "{0}.WFM"'.format(wfm))
+            self.write('MEMory:DELete "{0}.WFM"'.format(self._file_name_for(wfm)))
+            self._file_names.pop(wfm, None)
         self._written_wfm_names.difference_update(to_delete)
         return to_delete
 
@@ -639,10 +667,25 @@ class AWG2041(PulserInterface):
                            ''.format(missing))
             return self.get_loaded_assets()[0]
 
-        for ch_num, wfm in load_dict.items():
-            self.write('CH1:WAVeform "{0}.WFM"'.format(wfm))
-            self._loaded_assets[ch_num] = wfm
-        self.query('*OPC?')
+        with self._comm_lock:   # load + deferred enable = one critical section (AWG-008)
+            for attempt in range(1, 3):
+                try:
+                    for ch_num, wfm in load_dict.items():
+                        self.write('CH1:WAVeform "{0}.WFM"'
+                                   ''.format(self._file_name_for(wfm)))
+                        self._loaded_assets[ch_num] = wfm
+                    # Probe-proven sync (AWG-007); loading a big file into waveform
+                    # memory may take a while -> generous budget. Device-Clear retry
+                    # on the intermittent wedge (AWG-009).
+                    self._wait_after_block('CH1:WAVeform load',
+                                           str(list(load_dict.values())), max_s=60)
+                    break
+                except _BusWedgeRecovered as wedge:
+                    self.log.warning('Load attempt {0:d}/2: {1} — retrying.'
+                                     ''.format(attempt, wedge))
+            else:
+                raise RuntimeError('Waveform load wedged on 2 consecutive attempts '
+                                   '(bus recovered each time) — giving up (AWG-009).')
         # Apply a deferred output-enable intent now that a waveform exists (AWG-002).
         if self._intended_outputs.get(1):
             self.write('OUTPut:CH1:NORMal:STATe ON')
@@ -668,8 +711,9 @@ class AWG2041(PulserInterface):
                            '(AWG-003 pattern). Stop the pulser first.')
             return -1
         for wfm in list(self._written_wfm_names):
-            self.write('MEMory:DELete "{0}.WFM"'.format(wfm))
+            self.write('MEMory:DELete "{0}.WFM"'.format(self._file_name_for(wfm)))
         self._written_wfm_names = set()
+        self._file_names = {}
         self._loaded_assets = {}
         return 0
 
@@ -711,17 +755,22 @@ class AWG2041(PulserInterface):
     # =========================================================================
 
     def query(self, question):
-        """ Query the device and return the stripped answer string. """
-        return self.awg.query(question).strip().strip('"')
+        """ Query the device and return the stripped answer string. The write+read pair
+        is ATOMIC under the comm lock (AWG-008). """
+        with self._comm_lock:
+            return self.awg.query(question).strip().strip('"')
 
     def write(self, command):
-        """ Write a command to the device.  @return int: 0 """
-        self.awg.write(command)
+        """ Write a command to the device (comm-locked, AWG-008).  @return int: 0 """
+        with self._comm_lock:
+            self.awg.write(command)
         return 0
 
     def write_raw(self, message_bytes):
-        """ Write a raw bytes message (binary block transfers).  @return int: 0 """
-        self.awg.write_raw(message_bytes)
+        """ Write a raw bytes message (binary blocks; comm-locked, AWG-008).
+        @return int: 0 """
+        with self._comm_lock:
+            self.awg.write_raw(message_bytes)
         return 0
 
     def drain_events(self, max_events=30):
@@ -750,6 +799,123 @@ class AWG2041(PulserInterface):
         if response.startswith(':') and ' ' in response:
             return response.rsplit(' ', 1)[1]
         return response
+
+    def _drain_error_events(self):
+        """ Collect queued event strings (ALLEv?, max 10).  @return list of str """
+        events = []
+        for _ in range(10):
+            ev = self.query('ALLEv?')
+            events.append(ev)
+            if ev.startswith('0'):
+                break
+        return events
+
+    def _assert_no_error_events(self, context):
+        """ Raise RuntimeError (with the dequeued event texts) if *ESR? shows any of the
+        488.2 error bits (CME 32 | EXE 16 | DDE 8 | QYE 4). Non-error bits (PON, OPC,
+        URQ) are ignored. """
+        esr = int(self._parse_value(self.query('*ESR?')))
+        if esr & 0b00111100:
+            events = self._drain_error_events()
+            msg = ('AWG2041 reported error(s) after {0}: *ESR?={1}, events={2}'
+                   ''.format(context, esr, events))
+            self.log.error(msg)
+            raise RuntimeError(msg)
+
+    def _wait_after_block(self, what, wfm_name, max_s=None):
+        """ Probe-proven post-block synchronization (AWG-007): poll *ESR? with SHORT
+        timeouts until the instrument answers again (it holds the bus ~0.3-0.4 s after
+        a block), then check the error bits. Do NOT use *OPC? here (AWG-007).
+
+        AWG-009 recovery: if the poll budget runs out (the intermittent message-layer
+        hang — root cause open, tracked via NI I/O Trace), send a GPIB Selected Device
+        Clear and re-poll: SDC recovery is MEASURED to work on a live wedge without a
+        power-cycle. On recovery, raise _BusWedgeRecovered so the caller retries the
+        whole transfer; only if even SDC fails, raise the fatal power-cycle error. """
+        if max_s is None:
+            max_s = self._post_block_timeout_s
+        old_timeout = self.awg.timeout
+        self.awg.timeout = 2000
+        t0 = time.time()
+        try:
+            while True:
+                try:
+                    with self._comm_lock:   # atomic write+read (AWG-008)
+                        esr = int(self._parse_value(
+                            self.awg.query('*ESR?').strip().strip('"')))
+                    break
+                except Exception:
+                    if time.time() - t0 <= max_s:
+                        continue
+                    # AWG-009: budget exhausted -> Device Clear + re-poll
+                    self.log.warning('AWG2041: bus stuck after the {0} block for "{1}" '
+                                     '(>{2:d} s) — sending GPIB Device Clear (AWG-009).'
+                                     ''.format(what, wfm_name, int(max_s)))
+                    try:
+                        with self._comm_lock:
+                            self.awg.clear()
+                    except Exception:
+                        pass
+                    t1 = time.time()
+                    recovered = False
+                    while time.time() - t1 < 10:
+                        try:
+                            with self._comm_lock:
+                                self.awg.query('*ESR?')
+                            recovered = True
+                            break
+                        except Exception:
+                            pass
+                    if recovered:
+                        raise _BusWedgeRecovered(
+                            'bus wedged after the {0} block for "{1}"; recovered via '
+                            'GPIB Device Clear (AWG-009)'.format(what, wfm_name))
+                    raise RuntimeError(
+                        'AWG2041 bus wedged after the {0} block for "{1}" and even '
+                        'GPIB Device Clear did not recover it — power-cycle needed '
+                        '(AWG-009).'.format(what, wfm_name))
+        finally:
+            self.awg.timeout = old_timeout
+        if esr & 0b00111100:
+            events = self._drain_error_events()
+            msg = ('AWG2041 rejected the {0} block for "{1}": *ESR?={2}, events={3}'
+                   ''.format(what, wfm_name, esr, events))
+            self.log.error(msg)
+            raise RuntimeError(msg)
+
+    def _file_name_for(self, wfm_name, create=False):
+        """ Map a qudi waveform name to an 8.3-SAFE instrument file body (AWG-006,
+        measured 2026-07-24: DATA:DESTination rejects longer names with event 257
+        'File name error; file name too long', and a CURVe after the failed
+        destination WEDGES the GPIB bus). Mapping: uppercase, characters outside
+        [A-Z0-9_-] replaced by '_'; if the result exceeds 8 chars (or collides),
+        use '<first 5>_<nn>' with a session counter. The mapping is session-local,
+        like the waveform record itself.
+
+        @return str: file body (append '.WFM' for the instrument)
+        """
+        if wfm_name in self._file_names:
+            return self._file_names[wfm_name]
+        if not create:
+            raise ValueError('No instrument file is mapped for waveform "{0}" — it was '
+                             'never transferred this session.'.format(wfm_name))
+        base = ''.join(ch if (ch.isalnum() or ch in '_-') else '_'
+                       for ch in wfm_name.upper())
+        taken = set(self._file_names.values())
+        if len(base) <= 8 and base not in taken:
+            short = base
+        else:
+            for i in range(1, 100):
+                short = '{0}_{1:02d}'.format(base[:5], i)
+                if short not in taken:
+                    break
+            else:
+                raise ValueError('No free 8.3-safe file name left for waveform "{0}" '
+                                 '(AWG-006).'.format(wfm_name))
+            self.log.info('AWG2041: waveform "{0}" stored as "{1}.WFM" (8+3 file-name '
+                          'limit, AWG-006).'.format(wfm_name, short))
+        self._file_names[wfm_name] = short
+        return short
 
     def _analog_ch_num(self, a_ch):
         """ 'a_ch1' -> 1, validating the descriptor (raise ValueError otherwise). """
@@ -807,14 +973,39 @@ class AWG2041(PulserInterface):
                                               len(marker_payload), total))
             self.log.error('_transfer_waveform: ' + msg)
             raise ValueError(msg)
-        self.write('DATA:DESTination "{0}.WFM"'.format(wfm_name))
-        self.write('DATA:WIDTh 1')
-        self.write_raw(b'CURVe ' + self._block_header(len(analog_payload))
-                       + analog_payload)
-        self.query('*OPC?')
-        self.write_raw(b'MARKer:DATA ' + self._block_header(len(marker_payload))
-                       + marker_payload)
-        self.query('*OPC?')
+        file_body = self._file_name_for(wfm_name, create=True)   # 8.3-safe (AWG-006)
+        # The WHOLE transfer sequence is one critical section (AWG-008), retried up to
+        # 3x with GPIB-Device-Clear recovery on the intermittent wedge (AWG-009).
+        with self._comm_lock:
+            for attempt in range(1, 4):
+                try:
+                    # Clean status slate (*CLS) so checks see only errors CAUSED HERE
+                    # (attempt 4's 221 mis-attribution). Then: DEST + WIDTh with a
+                    # hard-stop error check (AWG-006), LF-terminated blocks (AWG-005),
+                    # polled-*ESR? sync (AWG-007).
+                    self.write('*CLS')
+                    self.write('DATA:DESTination "{0}.WFM"'.format(file_body))
+                    self.write('DATA:WIDTh 1')
+                    self._assert_no_error_events('DATA:DESTination "{0}.WFM" / '
+                                                 'DATA:WIDTh'.format(file_body))
+                    self.write_raw(b'CURVe ' + self._block_header(len(analog_payload))
+                                   + analog_payload + b'\n')
+                    self._wait_after_block('CURVe', wfm_name)
+                    self.write_raw(b'MARKer:DATA '
+                                   + self._block_header(len(marker_payload))
+                                   + marker_payload + b'\n')
+                    self._wait_after_block('MARKer:DATA', wfm_name)
+                    break
+                except _BusWedgeRecovered as wedge:
+                    self.log.warning('Transfer attempt {0:d}/3 for "{1}": {2} — '
+                                     'retrying the full transfer.'
+                                     ''.format(attempt, wfm_name, wedge))
+            else:
+                raise RuntimeError(
+                    'Waveform transfer for "{0}" wedged on 3 consecutive attempts '
+                    '(bus recovered via Device Clear each time) — giving up (AWG-009). '
+                    'The instrument is left responsive; investigate before retrying.'
+                    ''.format(wfm_name))
 
     @staticmethod
     def _block_header(n_bytes):
