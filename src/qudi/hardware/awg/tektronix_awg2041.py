@@ -29,7 +29,11 @@ SOURCED COMMANDS (AWG2000 Series Programmer Manual, in-repo full PDF; page refs)
     => a in [-1, 1] maps to DAC code round(127 + 127*a), i.e. 0..254 symmetric about 127.
   * Load: [CH1:]WAVeform "<name>.WFM" (p. 2-46). Output enable:
     OUTPut:CH1:NORMal:STATe {ON|OFF|<NR1>} (p. 2-149, AWG2040/41-specific).
-  * Run: STARt (p. 2-159) / STOP (p. 2-160) / RUNNing? -> 1|0 (p. 2-152).
+  * Run: STARt (p. 2-159) / STOP (p. 2-160) / RUNNing? -> 1|0 (p. 2-152) / MODE?
+    (p. 2-141). AWG-010 (measured 2026-07-30): in CONTINUOUS mode STOP is rejected
+    (event 221) and RUNNing? sticks at 1 (engine, not connector) — run control is
+    MODE-aware, off = output relay(s); CH1 has TWO connectors (NORMal + INVerted,
+    pp. 2-147..149), each with its own relay.
   * Levels: [CH1:]AMPLitude 0.020..2.000 V (p. 2-36), [CH1:]OFFSet (p. 2-42; spec range
     -1.000..+1.000 V); markers: [CH1:]MARKERLEVEL1|2:HIGH|LOW (pp. 2-39..2-42,
     AWG2040/41-specific; spec -2.0..+2.0 V into 50 ohm, 0.1 V resolution).
@@ -305,42 +309,111 @@ class AWG2041(PulserInterface):
     # PulserInterface: run control / status
     # =========================================================================
 
-    def pulser_on(self):
-        """ Start waveform output (STARt, p. 2-159).
+    def _get_mode(self):
+        """ MODE? (p. 2-141) -> uppercase mode string, e.g. 'CONTINUOUS'.
 
-        Defensively re-applies the intended output state first (AWG-002 pattern): ON
-        only if a waveform is loaded; an intended-ON channel without one is an error.
+        AWG-010: run-control semantics are MODE-dependent on this instrument, so
+        pulser_on/pulser_off/get_status must know the mode. The module still never
+        SETS the mode (first-light design rule) — it only reads it.
         """
-        if self._intended_outputs[1]:
-            if self._loaded_assets.get(1):
-                self.write('OUTPut:CH1:NORMal:STATe ON')
-            else:
-                self.log.error('pulser_on: CH1 is selected active but has no waveform '
-                               'loaded — enable would be meaningless (AWG-002 pattern). '
-                               'Load an asset first.')
-        self.write('STARt')
-        return self.get_status()[0]
+        return str(self._parse_value(self.query('MODE?'))).strip().upper()
+
+    def pulser_on(self):
+        """ Start waveform output — MODE-aware (AWG-010, measured 2026-07-30).
+
+        In CONTINUOUS mode the playback engine auto-runs (RUNNing? flips to 1 on
+        the first STARt / on mode entry and cannot be stopped — see pulser_off);
+        the connector is gated by the output RELAY. STARt (p. 2-159) is accepted
+        in every mode (measured: no event in CONTINUOUS) and is still sent when
+        the engine reports stopped — it is what started the engine after the
+        fresh power-on at first light (07-24), and the trigger event in
+        triggered modes.
+
+        Defensively re-applies the intended output state first (AWG-002 pattern):
+        ON only if a waveform is loaded; an intended-ON channel without one is an
+        error.
+        """
+        with self._comm_lock:   # relay + STARt + status = one critical section
+            if self._intended_outputs[1]:
+                if self._loaded_assets.get(1):
+                    self.write('OUTPut:CH1:NORMal:STATe ON')
+                else:
+                    self.log.error('pulser_on: CH1 is selected active but has no waveform '
+                                   'loaded — enable would be meaningless (AWG-002 pattern). '
+                                   'Load an asset first.')
+            try:
+                engine_running = bool(int(self._parse_value(self.query('RUNNing?'))))
+            except Exception:
+                engine_running = False
+            if not engine_running:
+                self.write('STARt')
+                self._assert_no_error_events('STARt (pulser_on)')
+            return self.get_status()[0]
 
     def pulser_off(self):
-        """ Stop waveform output (STOP, p. 2-160).  @return int: qudi status """
-        self.write('STOP')
-        return self.get_status()[0]
+        """ Stop waveform output — MODE-aware (AWG-010, measured 2026-07-30).
+
+        CONTINUOUS mode: STOP is REJECTED with event 221 'Settings conflict' and
+        the engine cannot be halted (a TRIGGERED+STOP round trip reads back 0 but
+        the engine restarts on re-entering CONTINUOUS). The honest off-switch is
+        the output RELAY: OUTPut:CH1:NORMal:STATe OFF (p. 2-149; front-panel LED
+        confirms the actuation). The INVerted relay (p. 2-147 — the SECOND CH1
+        connector on AWG2040/41) is also opened if unexpectedly closed. CAUTION:
+        never follow a relay-off with a mode change — re-entering CONTINUOUS was
+        observed to re-close relays. Intended-output bookkeeping (AWG-002) is NOT
+        changed here: pulser_on re-closes the relay for intended-active channels.
+
+        Other modes: STOP (p. 2-160) works and also resets the sequence pointer.
+
+        @return int: qudi status
+        """
+        with self._comm_lock:   # mode read + off sequence = one critical section
+            if self._get_mode().startswith('CONT'):
+                self.write('OUTPut:CH1:NORMal:STATe OFF')
+                try:
+                    inv_on = bool(int(self._parse_value(self.query('OUTPut:CH1:INVerted?'))))
+                except Exception:
+                    inv_on = False
+                if inv_on:
+                    self.log.warning('pulser_off: CH1 INVERTED output relay was ON — the '
+                                     'records say nothing hangs on that connector (check '
+                                     'the setup / connections.yaml). Opening it too.')
+                    self.write('OUTPut:CH1:INVerted:STATe OFF')
+                self._assert_no_error_events('output relay off (pulser_off)')
+            else:
+                self.write('STOP')
+                self._assert_no_error_events('STOP (pulser_off)')
+            return self.get_status()[0]
 
     def get_status(self):
-        """ RUNNing? (p. 2-152): 1 = outputting, 0 = not. Maps directly to qudi's
-        0 = stopped, 1 = running. (No 'waiting' state is reported by this query;
-        triggered/gated modes are phase-D+ territory.)
+        """ Effective run state — MODE-aware (AWG-010, measured 2026-07-30).
+
+        RUNNing? (p. 2-152) reports the playback ENGINE, which in CONTINUOUS mode
+        is permanently 1 once started and cannot be stopped (see pulser_off) —
+        with the output relays open it still answers 1 (measured; the manual's
+        "whether a waveform is being output" wording notwithstanding). The qudi
+        semantic 'running' = producing output at the connector, so in CONTINUOUS
+        mode this reports 1 only if the engine runs AND an output relay is
+        closed. This is also what re-opens qudi's settings gate: the logic
+        refuses set_pulse_generator_settings while this reports 1.
 
         @return (int, dict): current status and description dict (-1 = comms failure)
         """
         status_dic = {-1: 'Failed request or failed communication with device.',
                       0: 'Device has stopped, but can receive commands.',
                       1: 'Device is active and running.'}
-        try:
-            state = int(self._parse_value(self.query('RUNNing?')))
-        except Exception:
-            return -1, status_dic
-        return (1 if state else 0), status_dic
+        with self._comm_lock:   # multi-query status read = one critical section
+            try:
+                engine = bool(int(self._parse_value(self.query('RUNNing?'))))
+                if engine and self._get_mode().startswith('CONT'):
+                    normal_on = bool(int(self._parse_value(
+                        self.query('OUTPut:CH1:NORMal?'))))
+                    inverted_on = bool(int(self._parse_value(
+                        self.query('OUTPut:CH1:INVerted?'))))
+                    return (1 if (normal_on or inverted_on) else 0), status_dic
+            except Exception:
+                return -1, status_dic
+        return (1 if engine else 0), status_dic
 
     # =========================================================================
     # PulserInterface: sample rate
