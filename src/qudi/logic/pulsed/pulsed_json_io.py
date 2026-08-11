@@ -111,6 +111,15 @@ def export_to_json(file_path=None, blocks=None, ensembles=None, sequences=None):
 # ---------------------------------------------------------------------------- import helpers
 
 def _known_sampling_functions():
+    if not SamplingFunctions.parameters:
+        # The qudi manager console runs in a SEPARATE process (namespace server / rpyc), so
+        # the import_sampling_functions() call done by SequenceGeneratorLogic.on_activate in
+        # the qudi process is invisible here — class-level state does not cross processes.
+        # Lazily load the DEFAULT namespace set so validation works out-of-process too.
+        # NOTE: sampling functions added via the logic's additional-paths ConfigOption are
+        # NOT loaded by this fallback; files using such extensions must be imported in a
+        # process where those paths were imported (the rejection error stays loud + exact).
+        SamplingFunctions.import_sampling_functions([])
     return set(SamplingFunctions.parameters)
 
 
