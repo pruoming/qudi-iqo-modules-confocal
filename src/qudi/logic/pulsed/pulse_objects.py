@@ -114,7 +114,10 @@ class PulseBlockElement(object):
             return False
         if set(self.digital_high.items()) != set(other.digital_high.items()):
             return False
-        for chnl, func in self.pulse_function:
+        # CODE-002 fork fix (2026-08-11): iterating the dict itself yields KEYS, so any
+        # element with a non-empty pulse_function raised "too many values to unpack".
+        # Upstream PR candidate (stock bug, hits any analog-element comparison).
+        for chnl, func in self.pulse_function.items():
             if func != other.pulse_function[chnl]:
                 return False
         return True

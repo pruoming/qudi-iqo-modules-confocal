@@ -49,10 +49,9 @@ sees STEADY illumination — a blink between lines re-triggers the bleaching tra
 (cycle-1 lesson, progress 2026-07-02/03). A manual laser_on() is likewise preserved across
 frames and restored at teardown. Call laser_off() to stop the light.
 
-SAFETY: activation performs NO RF and NO motion; RF power is capped upstream (SAFE-004,
-power_max -10 dBm in the SMIQ config — supersedes SAFE-001/-7 dBm since the 2026-07-14 amp
-swap to the ZHL-16W-43-S+) and RF-ON is a human action (amp PSU). If this module
-owns the Pulse Streamer it sets all outputs LOW on activation.
+SAFETY: activation performs NO RF and NO motion; RF power is capped upstream (SAFE-005)
+and RF-ON is a human action (amp PSU). If this module owns the Pulse Streamer it sets all
+outputs LOW on activation.
 
 Example config (see Qudi_AI/setups/confocal_odmr/qudi_config_confocal_odmr.cfg):
 
@@ -81,6 +80,8 @@ Example config (see Qudi_AI/setups/confocal_odmr/qudi_config_confocal_odmr.cfg):
             keep_laser_on: True
             cbm_arm_delay: 0.05
             default_sample_rate: 200.0
+            # frame_timeout: 30.0        # optional; None/omitted -> auto (2x frame + 5 s)
+            # timetagger_serial: ''      # only when owning the Tagger and several attached
 
 Cycle-2 note: this file is the BLIND REBUILD of the cycle-1 module (rebuild_runbook.md step
 26b; seal rules Phase 4). Sources: progress.md 2026-07-02/03 ODMR entries, known_issues
@@ -159,6 +160,15 @@ class OdmrScanInput(FiniteSamplingInputInterface):
     # sync() + this delay before starting the Pulse Streamer, else a variable number of the
     # first detect edges are lost and point 0 slips (0.05 s proven; every sweep line re-arms).
     _cbm_arm_delay = ConfigOption(name='cbm_arm_delay', default=0.05)
+    # Readout timeout backstop in s; None -> auto = 2 x expected frame time + 5 s (design doc
+    # §6 factor — both rebuilds silently hardcoded 1.25x, a twice-recurred record gap; re-added
+    # 2026-08-11, answer-check A). A slow SMIQ / large mw_settle_time legitimately lengthens a
+    # line — raise this instead of accepting false timeouts.
+    _frame_timeout = ConfigOption(name='frame_timeout', default=None)
+    # Only used when this module OWNS the Time Tagger (no tagger_provider connected):
+    # '' -> the only connected Tagger; set the serial when more than one is attached
+    # (recurred gap, re-added 2026-08-11 — moot when borrowing, which all real configs do).
+    _timetagger_serial = ConfigOption(name='timetagger_serial', default='')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -181,6 +191,7 @@ class OdmrScanInput(FiniteSamplingInputInterface):
         # per-frame runtime state
         self._cbm = None                 # TimeTagger CountBetweenMarkers
         self._combiner = None            # TimeTagger Combiner (kept alive during frame)
+        self._detect_monitor = None      # TimeTagger Countrate on the detect channel (§9)
         self._consumed = 0               # points already returned to the consumer
         self._unread = None              # post-stop snapshot dict (drain buffer, SCAN-003)
         self._timed_out = False
@@ -214,6 +225,8 @@ class OdmrScanInput(FiniteSamplingInputInterface):
             raise ValueError('next_pulse_ns must be >= 1 ns.')
         if len(self._apd_channels) < 1:
             raise ValueError('apd_channels must name at least one Time Tagger channel.')
+        if self._frame_timeout is not None and not self._frame_timeout > 0:
+            raise ValueError('frame_timeout must be > 0 s, or None for auto (2x frame + 5 s).')
 
         # --- constraints (FiniteSamplingInput carries units + rate/size limits only) ---
         self._constraints = FiniteSamplingInputConstraints(
@@ -234,7 +247,10 @@ class OdmrScanInput(FiniteSamplingInputInterface):
             self.log.info(f'Time Tagger borrowed from provider (shared connection), '
                           f'serial {self._tagger.getSerial()}.')
         else:
-            self._tagger = tt.createTimeTagger()
+            if self._timetagger_serial:
+                self._tagger = tt.createTimeTagger(str(self._timetagger_serial))
+            else:
+                self._tagger = tt.createTimeTagger()
             self._owns_tagger = True
             self.log.info(f'Time Tagger connected (owned), '
                           f'serial {self._tagger.getSerial()}.')
@@ -375,6 +391,16 @@ class OdmrScanInput(FiniteSamplingInputInterface):
                 # per point, begin/end = detect rising/falling edge (same physical channel,
                 # ch_end = -ch_start — connections.yaml).
                 self._init_cbm()
+                # In-line detect-edge monitor for the timeout diagnostic (design §9 — the
+                # documented-but-unimplemented cycle-1 capability; re-added 2026-08-11):
+                # discriminates "markers not reaching the TT" from "window not closing".
+                try:
+                    self._detect_monitor = tt.Countrate(self._tagger,
+                                                        [int(self._detect_tt_channel)])
+                except Exception:
+                    self._detect_monitor = None
+                    self.log.warning('Could not create the detect-edge Countrate monitor; '
+                                     'timeout diagnostic will omit the edge rate.')
 
                 # (2) ARM BARRIER (SCAN-006): a fresh CountBetweenMarkers needs tens of ms
                 # to actually start listening; EVERY sweep line re-arms, so without this the
@@ -400,7 +426,13 @@ class OdmrScanInput(FiniteSamplingInputInterface):
                 self._frame_start = time.time()
                 frame_duration = self._frame_size / self._sample_rate
                 # Timeout backstop: return data instead of hanging forever (SCAN-001).
-                self._frame_deadline = self._frame_start + 1.25 * frame_duration + 5.0
+                # Configurable per the design-§6 contract; auto = 2x + 5 s (the hardcoded
+                # 1.25x both rebuilds guessed was a recurred record gap — answer-check A).
+                if self._frame_timeout is None:
+                    timeout = 2.0 * frame_duration + 5.0
+                else:
+                    timeout = float(self._frame_timeout)
+                self._frame_deadline = self._frame_start + timeout
         except Exception:
             try:
                 self._teardown()
@@ -486,7 +518,11 @@ class OdmrScanInput(FiniteSamplingInputInterface):
                     self.stop_buffered_acquisition()
             finally:
                 if remembered is not None:
-                    self.set_frame_size(remembered)
+                    # ODMR-002: restore by DIRECT assignment (cycle-1/dummy shape) — going
+                    # through set_frame_size() here could replace a successful acquisition's
+                    # return value with an AssertionError when the pre-call size was 0
+                    # (fresh module driven from the console). We already hold the lock.
+                    self._frame_size = remembered
             return result
 
     # ---------------------------------------------------------------- console helpers
@@ -711,20 +747,37 @@ class OdmrScanInput(FiniteSamplingInputInterface):
             except Exception:
                 pass
             self._cbm = None
+        if self._detect_monitor is not None:
+            try:
+                self._detect_monitor.stop()
+            except Exception:
+                pass
+            self._detect_monitor = None
         self._combiner = None
 
     def _log_timeout_diagnostic(self):
-        """ In-frame diagnostic: localize a stuck sweep line — closed-window count vs
-        expected tells a hardware shortfall (markers not arriving / SMIQ stalled sweep has
-        no effect here, the PS free-runs) apart from readout bugs. """
+        """ In-frame diagnostic (design §9): localize a stuck sweep line — closed windows
+        AND the live detect-edge rate tell 'markers not reaching the TT' (rate ~0:
+        wiring/PS side) apart from 'window not closing' (rate ~expected: readout/CBM side).
+        This method must never raise. """
         try:
             closed = int(np.count_nonzero(self._cbm.getBinWidths())) if self._cbm else -1
         except Exception:
             closed = -1
+        try:
+            # NOTE (SCAN-004 caveat): Countrate averages since creation — after a long stall
+            # the average understates a healthy live rate; interpret ~0 vs ~expected.
+            rate = float(self._detect_monitor.getData()[0]) \
+                if self._detect_monitor is not None else float('nan')
+        except Exception:
+            rate = float('nan')
+        expected = self._windows_per_point * self._sample_rate
         self.log.error(
             f'ODMR frame timeout after {time.time() - self._frame_start:.1f} s: '
             f'{closed} of {self._windows_per_point * self._frame_size} count windows '
-            f'closed, consumed {self._consumed}/{self._frame_size} points. Returning '
+            f'closed, consumed {self._consumed}/{self._frame_size} points, detect-edge '
+            f'rate {rate:.1f}/s (expected ~{expected:.1f}/s while streaming; ~0 = markers '
+            f'not reaching the TT, ~expected = windows not closing/readout). Returning '
             f'remaining points as zeros instead of hanging (SCAN-001 backstop). If windows '
             f'are missing, probe qudi-closed first (detect-edge rate on TT ch5) before '
             f'changing readout code.')

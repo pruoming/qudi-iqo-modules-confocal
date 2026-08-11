@@ -167,6 +167,16 @@ class AWG2041(PulserInterface):
         self._written_wfm_names = set()  # local record of waveforms transferred this session
         self._wfm_buffers = {}   # {wfm_name: {'a': [bytes,...], 'm': [bytes,...]}}
         self._wfm_totals = {}    # {wfm_name: expected total number of samples}
+        # AWG-009 QUIET WINDOW (answer-check B §1 design, 2026-08-11): while a sample->load
+        # window is open, get_status() answers from this cache WITHOUT touching the
+        # instrument or the comm lock — the open AWG-009 lead is status traffic landing
+        # inside the transfer->load window (serialized by the lock, but the instrument
+        # still sees it), and a wedge otherwise blocks the poller ~2 min on the lock.
+        # The window only opens from a VERIFIED-STOPPED state; wall-clock expiry is the
+        # abandoned-sampling safety net.
+        self._quiet = False
+        self._quiet_status = None
+        self._quiet_until = 0.0
         self._intended_outputs = {1: False}  # AWG-002 pattern (see get_active_channels)
         self._file_names = {}    # {qudi wfm name: 8.3-safe instrument file body} (AWG-006)
         # AWG-008: ALL VISA traffic is serialized by this lock. Qudi is multi-threaded
@@ -233,6 +243,7 @@ class AWG2041(PulserInterface):
 
     def on_deactivate(self):
         """ Close the VISA connection; discard any half-buffered waveform chunks. """
+        self._clear_quiet()
         self._discard_wfm_buffers()
         try:
             self.awg.close()
@@ -333,10 +344,14 @@ class AWG2041(PulserInterface):
         ON only if a waveform is loaded; an intended-ON channel without one is an
         error.
         """
+        self._clear_quiet()   # any run-control action ends a quiet window (AWG-009)
         with self._comm_lock:   # relay + STARt + status = one critical section
             if self._intended_outputs[1]:
                 if self._loaded_assets.get(1):
                     self.write('OUTPut:CH1:NORMal:STATe ON')
+                    # AWG-012: unchecked relay rejections queue events that poison later
+                    # error checks (AWG-010 lesson) and get wiped by the next *CLS.
+                    self._assert_no_error_events('output relay on (pulser_on)')
                 else:
                     self.log.error('pulser_on: CH1 is selected active but has no waveform '
                                    'loaded — enable would be meaningless (AWG-002 pattern). '
@@ -367,6 +382,7 @@ class AWG2041(PulserInterface):
 
         @return int: qudi status
         """
+        self._clear_quiet()   # any run-control action ends a quiet window (AWG-009)
         with self._comm_lock:   # mode read + off sequence = one critical section
             if self._get_mode().startswith('CONT'):
                 self.write('OUTPut:CH1:NORMal:STATe OFF')
@@ -402,6 +418,17 @@ class AWG2041(PulserInterface):
         status_dic = {-1: 'Failed request or failed communication with device.',
                       0: 'Device has stopped, but can receive commands.',
                       1: 'Device is active and running.'}
+        # AWG-009 quiet window: while a sample->load window is open, answer from the
+        # cache — no instrument traffic, no comm-lock wait. The window opened from a
+        # verified-stopped state and only pulser_on (which clears it) legally changes
+        # that; a front-panel STARt mid-transfer goes unnoticed until the window closes
+        # (negligible + self-correcting). Wall-clock expiry covers abandoned samplings.
+        if self._quiet:
+            if time.time() < self._quiet_until:
+                return self._quiet_status
+            self._clear_quiet()
+            self.log.warning('AWG-009 quiet window expired (>5 min) without a load — '
+                             'was a sampling abandoned? Resuming live status queries.')
         with self._comm_lock:   # multi-query status read = one critical section
             try:
                 engine = bool(int(self._parse_value(self.query('RUNNing?'))))
@@ -564,8 +591,10 @@ class AWG2041(PulserInterface):
                 self._intended_outputs[1] = bool(state)
                 if not state:
                     self.write('OUTPut:CH1:NORMal:STATe OFF')
+                    self._assert_no_error_events('output relay off (set_active_channels)')
                 elif self._loaded_assets.get(1):
                     self.write('OUTPut:CH1:NORMal:STATe ON')
+                    self._assert_no_error_events('output relay on (set_active_channels)')
                 else:
                     self.log.debug('CH1 ON deferred until a waveform is loaded '
                                    '(AWG-002 pattern).')
@@ -608,6 +637,7 @@ class AWG2041(PulserInterface):
         if len(analog_samples) == 0:
             self.log.error('write_waveform: no analog samples passed (the AWG2041 '
                            'waveform file is built around the CH1 analog data).')
+            self._clear_quiet()   # a failed chunk series must not leave the window open
             return -1, waveforms
 
         if is_first_chunk:
@@ -637,12 +667,24 @@ class AWG2041(PulserInterface):
                        'the ensemble deliberately.'.format(total, granularity))
                 self.log.error('write_waveform: ' + msg)
                 raise ValueError(msg)
+            # AWG-009 QUIET WINDOW opens ONLY after every first-chunk validation passed
+            # (the AWG-003 guard above verified status (0, stopped)): until load_waveform
+            # closes the window (or it expires / a failure path clears it), get_status()
+            # answers from this cache so NO status traffic lands inside the
+            # transfer->load window (answer-check B §1; suppress, not serialize).
+            self._quiet_status = (0, {-1: 'Failed request or failed communication with '
+                                         'device.',
+                                     0: 'Device has stopped, but can receive commands.',
+                                     1: 'Device is active and running.'})
+            self._quiet_until = time.time() + 300.0
+            self._quiet = True
 
         chunk_length = len(analog_samples[list(analog_samples)[0]])
         for chnl, samples in list(analog_samples.items()) + list(digital_samples.items()):
             if len(samples) != chunk_length:
                 self.log.error('write_waveform: unequal sample array lengths across channels.')
                 self._discard_wfm_buffers(prefix=name)
+                self._clear_quiet()   # failed series -> close the AWG-009 quiet window
                 return -1, waveforms
 
         activation = self.get_active_channels()
@@ -652,6 +694,7 @@ class AWG2041(PulserInterface):
                            'and provided sample arrays {1}.'
                            ''.format(active_analog, sorted(analog_samples)))
             self._discard_wfm_buffers(prefix=name)
+            self._clear_quiet()   # failed series -> close the AWG-009 quiet window
             return -1, waveforms
 
         wfm_name = '{0}_ch1'.format(name)
@@ -666,7 +709,11 @@ class AWG2041(PulserInterface):
         self._wfm_buffers[wfm_name]['m'].append(marker_bytes.tobytes())
 
         if is_last_chunk:
-            self._transfer_waveform(wfm_name)
+            try:
+                self._transfer_waveform(wfm_name)
+            except Exception:
+                self._clear_quiet()   # failed transfer -> close the AWG-009 quiet window
+                raise
             self._written_wfm_names.add(wfm_name)
         waveforms.append(wfm_name)
 
@@ -706,6 +753,11 @@ class AWG2041(PulserInterface):
         for wfm in to_delete:
             self.write('MEMory:DELete "{0}.WFM"'.format(self._file_name_for(wfm)))
             self._file_names.pop(wfm, None)
+            # AWG-011: deleting the currently loaded waveform must clear the loaded-asset
+            # record too, or pulser_on keeps believing an asset is loaded.
+            for ch_num in [ch for ch, loaded in self._loaded_assets.items()
+                           if loaded == wfm]:
+                self._loaded_assets.pop(ch_num, None)
         self._written_wfm_names.difference_update(to_delete)
         return to_delete
 
@@ -740,29 +792,41 @@ class AWG2041(PulserInterface):
                            ''.format(missing))
             return self.get_loaded_assets()[0]
 
-        with self._comm_lock:   # load + deferred enable = one critical section (AWG-008)
-            for attempt in range(1, 3):
-                try:
-                    for ch_num, wfm in load_dict.items():
-                        self.write('CH1:WAVeform "{0}.WFM"'
-                                   ''.format(self._file_name_for(wfm)))
-                        self._loaded_assets[ch_num] = wfm
-                    # Probe-proven sync (AWG-007); loading a big file into waveform
-                    # memory may take a while -> generous budget. Device-Clear retry
-                    # on the intermittent wedge (AWG-009).
-                    self._wait_after_block('CH1:WAVeform load',
-                                           str(list(load_dict.values())), max_s=60)
-                    break
-                except _BusWedgeRecovered as wedge:
-                    self.log.warning('Load attempt {0:d}/2: {1} — retrying.'
-                                     ''.format(attempt, wedge))
-            else:
-                raise RuntimeError('Waveform load wedged on 2 consecutive attempts '
-                                   '(bus recovered each time) — giving up (AWG-009).')
-        # Apply a deferred output-enable intent now that a waveform exists (AWG-002).
-        if self._intended_outputs.get(1):
-            self.write('OUTPut:CH1:NORMal:STATe ON')
-            self.query('*OPC?')
+        try:
+            with self._comm_lock:   # load + deferred enable = one critical section (AWG-008)
+                for attempt in range(1, 3):
+                    try:
+                        staged = dict()
+                        for ch_num, wfm in load_dict.items():
+                            self.write('CH1:WAVeform "{0}.WFM"'
+                                       ''.format(self._file_name_for(wfm)))
+                            staged[ch_num] = wfm
+                        # Probe-proven sync (AWG-007); loading a big file into waveform
+                        # memory may take a while -> generous budget. Device-Clear retry
+                        # on the intermittent wedge (AWG-009).
+                        self._wait_after_block('CH1:WAVeform load',
+                                               str(list(load_dict.values())), max_s=60)
+                        # AWG-011: commit the bookkeeping only after the load is
+                        # CONFIRMED — this record is the module's only load authority
+                        # (no CH1:WAVeform? readback yet), and pulser_on closes the
+                        # relay on it; a failed load must not leave it lying.
+                        self._loaded_assets.update(staged)
+                        break
+                    except _BusWedgeRecovered as wedge:
+                        self.log.warning('Load attempt {0:d}/2: {1} — retrying.'
+                                         ''.format(attempt, wedge))
+                else:
+                    raise RuntimeError('Waveform load wedged on 2 consecutive attempts '
+                                       '(bus recovered each time) — giving up (AWG-009).')
+            # Apply a deferred output-enable intent now that a waveform exists (AWG-002).
+            if self._intended_outputs.get(1):
+                self.write('OUTPut:CH1:NORMal:STATe ON')
+                # AWG-012: event check instead of the former *OPC? — that query
+                # contradicted AWG-007's no-*OPC?-in-the-load-path rule AND left relay
+                # rejections silently queued (the AWG-002 phase-C question needs them).
+                self._assert_no_error_events('deferred OUTPut ON (load_waveform)')
+        finally:
+            self._clear_quiet()   # AWG-009: the sample->load quiet window ends here
         return self.get_loaded_assets()[0]
 
     def load_sequence(self, sequence_name):
@@ -779,6 +843,7 @@ class AWG2041(PulserInterface):
         """ Delete THIS SESSION'S waveform files from internal memory and forget local
         bookkeeping. Deliberately NOT 'MEMory:DELete All' — internal memory can hold
         unrelated user files.  @return int: 0 OK, -1 refused while running """
+        self._clear_quiet()   # explicit lifecycle action ends any quiet window (AWG-009)
         if self.get_status()[0] != 0:
             self.log.error('clear_all: the AWG is running (or unreachable) — refusing '
                            '(AWG-003 pattern). Stop the pulser first.')
@@ -812,6 +877,7 @@ class AWG2041(PulserInterface):
         item) — the local waveform record is KEPT (5014C policy); clear_all() is the
         explicit wipe. Output intent is re-synced from the instrument.
         """
+        self._clear_quiet()   # explicit lifecycle action ends any quiet window (AWG-009)
         self.write('*RST')
         self.query('*OPC?')
         self._loaded_assets = {}
@@ -862,6 +928,14 @@ class AWG2041(PulserInterface):
     # =========================================================================
     # Internal helpers
     # =========================================================================
+
+    def _clear_quiet(self):
+        """ Close the AWG-009 quiet window (see __init__): get_status() goes back to live
+        instrument queries. Called from load_waveform (finally), every run-control /
+        lifecycle action, and the wall-clock expiry. """
+        self._quiet = False
+        self._quiet_status = None
+        self._quiet_until = 0.0
 
     @staticmethod
     def _parse_value(response):

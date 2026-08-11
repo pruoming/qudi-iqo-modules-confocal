@@ -31,7 +31,7 @@ owns) its own connection. It only asserts device output/idle states on devices i
 SAFETY: activation performs NO motion, starts NO NI task, and (if it owns the Pulse Streamer)
 sets all PS outputs LOW. Laser gating (enable_laser / idle_laser_on / laser_on()) and stage
 motion are HUMAN-APPROVED actions (approved_actions.yaml); RF power is capped upstream
-(SAFE-001) and never touched here.
+(SAFE-005) and never touched here.
 
 Example config (see Qudi_AI/setups/confocal_odmr/qudi_config_confocal_counter.cfg):
 
@@ -63,6 +63,8 @@ Example config (see Qudi_AI/setups/confocal_odmr/qudi_config_confocal_counter.cf
             default_sample_rate: 200.0
             settle_time: 0.05
             cbm_arm_delay: 0.05
+            # frame_timeout: 30.0        # optional; None/omitted -> auto (2x frame + 5 s)
+            # timetagger_serial: ''      # only when owning the Tagger and several attached
 
 Cycle-2 note: this file is the BLIND REBUILD of the cycle-1 module, written fresh from the
 Qudi_AI records only (rebuild_runbook.md step 21b; sources: confocal_scanner_design.md §5/§8/§10,
@@ -145,6 +147,14 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
     # edges are lost and the count<->position registration slips per frame (SCAN-006;
     # 0.05 s proven 12/12 at 1 kHz — do not reduce without re-probing).
     _cbm_arm_delay = ConfigOption(name='cbm_arm_delay', default=0.05)
+    # Readout timeout backstop in s; None -> auto = 2 x expected frame time + 5 s (design doc
+    # §6 factor — both rebuilds silently hardcoded 1.25x, a twice-recurred record gap; re-added
+    # 2026-08-11, answer-check A). Raise for legitimately long frames instead of hardcoding.
+    _frame_timeout = ConfigOption(name='frame_timeout', default=None)
+    # Only used when this module OWNS the Time Tagger (no tagger_provider connected):
+    # '' -> the only connected Tagger; set the serial when more than one is attached
+    # (recurred gap, re-added 2026-08-11 — moot when borrowing, which all real configs do).
+    _timetagger_serial = ConfigOption(name='timetagger_serial', default='')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -171,6 +181,10 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
         self._ao_task = None
         self._cbm = None                     # TimeTagger CountBetweenMarkers
         self._combiner = None                # TimeTagger Combiner (kept alive during frame)
+        self._detect_monitor = None          # TimeTagger Countrate on the detect channel
+        # Manual-laser continuity (ported from the odmr sibling 2026-08-11, answer-check A:
+        # a console laser_on() must survive a scan and its teardown, not be silently killed).
+        self._laser_is_on = False
         self._consumed = 0                   # pixels already returned to the consumer
         self._unread = None                  # post-stop snapshot dict (SCAN-003 drain buffer)
         self._timed_out = False
@@ -200,6 +214,8 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             raise ValueError('ao_voltage_limits must be [min, max].')
         if int(self._pixel_next_pulse_ns) < 1:
             raise ValueError('pixel_next_pulse_ns must be >= 1 ns.')
+        if self._frame_timeout is not None and not self._frame_timeout > 0:
+            raise ValueError('frame_timeout must be > 0 s, or None for auto (2x frame + 5 s).')
 
         self._ao_channels = [str(ch).strip('/').lower() for ch in self._ao_channels]
 
@@ -212,7 +228,10 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             frame_size_limits=(1, int(1e8)),
             sample_rate_limits=(0.1, 1e4),
             output_channel_limits={ch: v_lim for ch in self._ao_channels},
-            input_channel_limits={self._input_channel_name: (0, int(1e9))}
+            # (-inf, inf) like cycle 1: diff mode legitimately produces NEGATIVE c/s. No
+            # consumer enforces these limits (verified fork-wide 2026-08-09, answer-check A —
+            # design doc §8 watch CLOSED); value fixed 2026-08-11 for record consistency.
+            input_channel_limits={self._input_channel_name: (-np.inf, np.inf)}
         )
 
         # --- Time Tagger: borrow from the provider if connected, else own ---
@@ -228,7 +247,10 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             self.log.info(f'Time Tagger borrowed from provider (shared connection), '
                           f'serial {self._tagger.getSerial()}.')
         else:
-            self._tagger = tt.createTimeTagger()
+            if self._timetagger_serial:
+                self._tagger = tt.createTimeTagger(str(self._timetagger_serial))
+            else:
+                self._tagger = tt.createTimeTagger()
             self._owns_tagger = True
             self.log.info(f'Time Tagger connected (owned), '
                           f'serial {self._tagger.getSerial()}.')
@@ -427,6 +449,16 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
                 # (3) Arm the Time Tagger CountBetweenMarkers: 2 windows per pixel
                 # (A = mw-on half, B = mw-off half), begin/end = detect rising/falling edge.
                 self._init_cbm()
+                # In-scan detect-edge monitor for the timeout diagnostic (cycle-1 capability
+                # lost twice in rebuilds; re-added 2026-08-11, answer-check A / design §9):
+                # discriminates "markers not reaching the TT" from "window not closing".
+                try:
+                    self._detect_monitor = tt.Countrate(self._tagger,
+                                                        [int(self._detect_tt_channel)])
+                except Exception:
+                    self._detect_monitor = None
+                    self.log.warning('Could not create the detect-edge Countrate monitor; '
+                                     'timeout diagnostic will omit the edge rate.')
 
                 # (4) ARM BARRIER (SCAN-006): a fresh CountBetweenMarkers needs tens of ms to
                 # actually start listening. sync() is guarded so its absence cannot break
@@ -450,7 +482,13 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
                 self._frame_start = time.time()
                 frame_duration = self._frame_size / self._sample_rate
                 # Timeout backstop: return data instead of hanging forever (SCAN-001).
-                self._frame_deadline = self._frame_start + 1.25 * frame_duration + 5.0
+                # Configurable per the design-§6 contract; auto = 2x + 5 s (the hardcoded
+                # 1.25x both rebuilds guessed was a recurred record gap — answer-check A).
+                if self._frame_timeout is None:
+                    timeout = 2.0 * frame_duration + 5.0
+                else:
+                    timeout = float(self._frame_timeout)
+                self._frame_deadline = self._frame_start + timeout
         except Exception:
             try:
                 self._teardown()
@@ -541,6 +579,9 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             self.log.error('Refusing laser_on(): a scan frame is running.')
             return
         self._pulser.constant(self._laser_output_state(True))
+        # Track it (answer-check A / design §8): a manual laser stays HIGH in-scan and is
+        # restored at teardown — same behaviour as the odmr sibling's _laser_is_on.
+        self._laser_is_on = True
         self.log.warning('Laser gate HIGH (console laser_on — human-approved action).')
 
     def laser_off(self):
@@ -549,6 +590,7 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             self.log.error('Refusing laser_off(): a scan frame is running.')
             return
         self._pulser.constant(pstr.OutputState.ZERO())
+        self._laser_is_on = False
         self.log.info('Pulse Streamer outputs LOW (laser off).')
 
     def set_pixel_settle_time(self, seconds):
@@ -569,8 +611,10 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
         return term
 
     def _idle_output_state(self):
-        """ Idle PS state for a device we OWN: laser HIGH iff idle_laser_on, else all LOW. """
-        if self._owns_pulser and self._idle_laser_on:
+        """ Idle/teardown PS state: laser HIGH if a manual laser_on() is active (explicit
+        human action — must survive a scan, answer-check A) or, on an OWNED device, iff
+        idle_laser_on. All LOW otherwise. """
+        if self._laser_is_on or (self._owns_pulser and self._idle_laser_on):
             return self._laser_output_state(True)
         return pstr.OutputState.ZERO()
 
@@ -582,7 +626,9 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
         """ Create + start the NI AO task: JUMP_LIST frame, external sample clock on PFI0.
         The task is armed and emits one sample per pixel_next rising edge (first sample on
         the FIRST edge — SCAN-007). """
-        task = ni.Task(f'ConfocalScanAO_{id(self):d}')
+        # Anonymous task like cycle 1 (SCAN-010): a CONSTANT name + one leaked close() would
+        # wedge every later scan with DAQmx "task name already exists" until a qudi restart.
+        task = ni.Task()
         try:
             lo, hi = self._constraints.output_channel_limits[self._ao_channels[0]]
             for ch in self._ao_channels:
@@ -675,7 +721,10 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             detect = pattern([(settle + skip, 0), (win_a, 1), (skip, 0), (win_b, 1),
                               (pn, 0)])
             mw = pattern([(settle, 0), (region_a, 1), (region_b + pn, 0)])
-        laser = pattern([(T, 1 if self._enable_laser else 0)]) or [(T, 0)]
+        # Laser HIGH if configured for scans OR a manual laser_on() is active (continuity,
+        # answer-check A: a deliberately-lit laser must not drop LOW for the frame).
+        laser_high = self._enable_laser or self._laser_is_on
+        laser = pattern([(T, 1 if laser_high else 0)]) or [(T, 0)]
 
         # settle-aware per-window integration times for the c/s normalization (SCAN-007/008):
         # diff normalizes by window A exactly; sum by the ACTUAL total count-window duration
@@ -786,11 +835,19 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             except Exception:
                 pass
             self._cbm = None
+        if self._detect_monitor is not None:
+            try:
+                self._detect_monitor.stop()
+            except Exception:
+                pass
+            self._detect_monitor = None
         self._combiner = None
 
     def _log_timeout_diagnostic(self):
-        """ In-scan diagnostic (SCAN-001/004): localize a stuck frame — closed-window count
-        vs expected and AO task state tell hardware shortfall apart from readout bugs. """
+        """ In-scan diagnostic (SCAN-001/004, design §9): localize a stuck frame — closed
+        windows, AO state AND the live detect-edge rate tell 'markers not reaching the TT'
+        (rate ~0: wiring/PS side) apart from 'window not closing' (rate ~2x sample rate:
+        readout/CBM side). This method must never raise. """
         try:
             closed = int(np.count_nonzero(self._cbm.getBinWidths())) if self._cbm else -1
         except Exception:
@@ -799,10 +856,20 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
             ao_done = self._ao_task.is_task_done() if self._ao_task is not None else None
         except Exception:
             ao_done = None
+        try:
+            # NOTE (SCAN-004): Countrate averages since creation — after a long stall the
+            # average understates a healthy live rate; interpret ~0 vs ~2x, not exact values.
+            rate = float(self._detect_monitor.getData()[0]) \
+                if self._detect_monitor is not None else float('nan')
+        except Exception:
+            rate = float('nan')
+        expected = 2.0 * self._sample_rate
         self.log.error(
             f'Frame timeout after {time.time() - self._frame_start:.1f} s: '
             f'{closed} of {2 * self._frame_size} count windows closed, '
-            f'NI AO task done: {ao_done}, consumed {self._consumed}/{self._frame_size} px. '
+            f'NI AO task done: {ao_done}, consumed {self._consumed}/{self._frame_size} px, '
+            f'detect-edge rate {rate:.1f}/s (expected ~{expected:.1f}/s while streaming; '
+            f'~0 = markers not reaching the TT, ~expected = windows not closing/readout). '
             f'Returning remaining pixels as zeros instead of hanging (SCAN-001 backstop). '
             f'If windows are missing at high pixel rates, probe qudi-closed first '
             f'(SCAN-004 note) before changing readout code.')
