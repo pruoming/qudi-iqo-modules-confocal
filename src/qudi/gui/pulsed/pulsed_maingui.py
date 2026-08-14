@@ -308,6 +308,20 @@ class PulsedMeasurementGui(GuiBase):
         self._mw.action_Settings_Analysis.triggered.connect(self.show_analysis_settings)
         self._mw.action_Settings_Generator.triggered.connect(self.show_generator_settings)
         self._mw.action_FitSettings.triggered.connect(self._fcd.show)
+        # T19 (owner-approved 2026-08-13): one-step "Import JSON…" action. Created in code
+        # (not the .ui) and added to the File menu if present, else the menu bar. It imports
+        # a .pulse.json via the validated pulsed_json_io path; save_block/save_ensemble emit
+        # the dict-updated signals the GUI already listens to, so the lists refresh.
+        self._mw.action_import_json = QtWidgets.QAction('Import JSON…', self._mw)
+        self._mw.action_import_json.setToolTip(
+            'Import a pulse-sequence .pulse.json (format_version 1 or 2) into the editor')
+        _menu = None
+        for _m in self._mw.menuBar().findChildren(QtWidgets.QMenu):
+            if _m.title().replace('&', '').lower().startswith('file'):
+                _menu = _m
+                break
+        (_menu or self._mw.menuBar()).addAction(self._mw.action_import_json)
+        self._mw.action_import_json.triggered.connect(self.import_json_clicked)
         return
 
     def _connect_dialog_signals(self):
@@ -474,6 +488,46 @@ class PulsedMeasurementGui(GuiBase):
         self._mw.action_Settings_Analysis.triggered.disconnect()
         self._mw.action_Settings_Generator.triggered.disconnect()
         self._mw.action_FitSettings.triggered.disconnect()
+        self._mw.action_import_json.triggered.disconnect()   # T19
+
+    @QtCore.Slot()
+    def import_json_clicked(self):
+        """T19: import a pulse-sequence .pulse.json into the editor in one step.
+
+        Opens a file dialog, imports via the validated pulsed_json_io path with save=True on
+        the sequence generator logic (the stock save_block/save_ensemble emit the dict-updated
+        signals the GUI already listens to, so the lists refresh). Import is ALL-OR-NOTHING:
+        the file is fully validated before anything is saved, so a rejected file changes
+        nothing. Errors surface in a dialog AND the qudi log with the full PulseJsonError text.
+        The import is fast (parse + build a few objects + pickle), following the stock
+        save_as_clicked precedent of calling a logic method directly from a dialog handler.
+        """
+        from qudi.logic.pulsed.pulsed_json_io import import_from_json
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._mw, 'Import pulse-sequence JSON…', '',
+            'Pulse JSON (*.pulse.json *.json);;All files (*)')
+        if not file_path:
+            return
+        self._mw.action_import_json.setEnabled(False)
+        try:
+            sgl = self.pulsedmasterlogic().sequencegeneratorlogic()
+            created = import_from_json(file_path, sgl, save=True)
+            nb, ne, ns = (len(created['blocks']), len(created['ensembles']),
+                          len(created['sequences']))
+            self.log.info('Imported {0} block(s), {1} ensemble(s), {2} sequence(s) from '
+                          '"{3}". v2 display labels are dropped on import (qudi objects carry '
+                          'none).'.format(nb, ne, ns, file_path))
+            QtWidgets.QMessageBox.information(
+                self._mw, 'Import JSON',
+                'Imported {0} block(s), {1} ensemble(s), {2} sequence(s).\n'
+                'They now appear in the editor lists.'.format(nb, ne, ns))
+        except Exception as err:
+            self.log.error('Pulse-JSON import failed for "{0}": {1}'.format(file_path, err))
+            QtWidgets.QMessageBox.critical(
+                self._mw, 'Import JSON — rejected',
+                'The file was NOT imported — nothing changed:\n\n{0}'.format(err))
+        finally:
+            self._mw.action_import_json.setEnabled(True)
 
     def _disconnect_dialog_signals(self):
         # Connect signals used in predefined methods config dialog

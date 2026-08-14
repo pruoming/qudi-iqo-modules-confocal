@@ -339,3 +339,77 @@ def import_from_json(source, sequence_generator_logic=None, save=True):
             sequence_generator_logic.save_sequence(sequence)
 
     return created
+
+
+# ---------------------------------------------------------------------------- CLI (T20)
+
+def _cli_persist(created, assets_dir=None):
+    """Persist imported objects into the qudi saved-assets dir via the STOCK
+    SequenceGeneratorLogic pickle helpers, WITHOUT a running qudi (no Module activation).
+
+    It borrows the unbound stock ``_save_*_to_file`` methods — i.e. qudi's own pickle
+    code writes the .block/.ensemble/.sequence files, the pickle boundary is untouched —
+    and provides only the two attributes those methods use (``_assets_storage_dir`` and
+    ``log``). Returns the assets directory used. Default dir mirrors the logic's
+    ConfigOption default (<home>/saved_pulsed_assets); override with --assets-dir when the
+    setup's config sets a custom assets_storage_path.
+    """
+    import logging
+    from qudi.logic.pulsed.sequence_generator_logic import SequenceGeneratorLogic
+    from qudi.util.paths import get_home_dir
+    directory = assets_dir or os.path.join(get_home_dir(), 'saved_pulsed_assets')
+    os.makedirs(directory, exist_ok=True)
+
+    class _Saver:
+        pass
+    saver = _Saver()
+    saver._assets_storage_dir = directory
+    saver.log = logging.getLogger('qudi.pulsed_json_io.cli')
+    for block in created['blocks']:
+        SequenceGeneratorLogic._save_block_to_file(saver, block)
+    for ensemble in created['ensembles']:
+        SequenceGeneratorLogic._save_ensemble_to_file(saver, ensemble)
+    for sequence in created['sequences']:
+        SequenceGeneratorLogic._save_sequence_to_file(saver, sequence)
+    return directory
+
+
+def _main(argv):
+    """CLI: python -m qudi.logic.pulsed.pulsed_json_io <file.pulse.json> [more...]
+
+    Imports each file through the SAME validated import_from_json path (all-or-nothing per
+    file: a rejected file writes nothing) and persists via the stock pickle helpers into the
+    saved-assets dir — no running qudi required. Works with a running qudi too, but its GUI
+    lists refresh only at the next qudi start or via the pulsed GUI 'Import JSON…' refresh.
+    Per-file OK/FAIL summary; nonzero exit on any failure.
+    """
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog='python -m qudi.logic.pulsed.pulsed_json_io',
+        description='Import pulse-sequence JSON file(s) into the qudi saved-assets '
+                    'directory (no running qudi needed). Validates via the same path the '
+                    'GUI uses; v2 display labels are stripped (qudi objects carry none).')
+    parser.add_argument('files', nargs='+', help='.pulse.json file(s) to import')
+    parser.add_argument('--assets-dir', default=None,
+                        help='override the saved_pulsed_assets directory')
+    args = parser.parse_args(argv)
+
+    n_ok = n_fail = 0
+    for path in args.files:
+        try:
+            created = import_from_json(path, None, save=False)   # validate + build only
+            directory = _cli_persist(created, args.assets_dir)   # stock pickle helpers
+            print('OK    {0}  ->  {1} block(s), {2} ensemble(s), {3} sequence(s)  [{4}]'
+                  ''.format(path, len(created['blocks']), len(created['ensembles']),
+                            len(created['sequences']), directory))
+            n_ok += 1
+        except Exception as err:   # PulseJsonError or IO/OS error — report, do not persist
+            print('FAIL  {0}  ->  {1}'.format(path, err))
+            n_fail += 1
+    print('\n{0} ok, {1} failed'.format(n_ok, n_fail))
+    return 1 if n_fail else 0
+
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(_main(sys.argv[1:]))
