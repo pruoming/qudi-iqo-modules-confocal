@@ -35,7 +35,7 @@ from qudi.util.colordefs import QudiPalettePale as palette
 from qudi.util.widgets.fitting import FitConfigurationDialog
 from qudi.core.module import GuiBase
 from qudi.util import uic
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from qudi.util.widgets.scientific_spinbox import ScienDSpinBox, ScienSpinBox
 from qudi.util.widgets.loading_indicator import CircleLoadingIndicator
 
@@ -312,7 +312,7 @@ class PulsedMeasurementGui(GuiBase):
         # (not the .ui) and added to the File menu if present, else the menu bar. It imports
         # a .pulse.json via the validated pulsed_json_io path; save_block/save_ensemble emit
         # the dict-updated signals the GUI already listens to, so the lists refresh.
-        self._mw.action_import_json = QtWidgets.QAction('Import JSON…', self._mw)
+        self._mw.action_import_json = QtGui.QAction('Import JSON…', self._mw)   # Qt6: QAction is in QtGui
         self._mw.action_import_json.setToolTip(
             'Import a pulse-sequence .pulse.json (format_version 1 or 2) into the editor')
         _menu = None
