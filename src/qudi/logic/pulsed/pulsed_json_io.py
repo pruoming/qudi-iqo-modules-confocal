@@ -47,11 +47,14 @@ Copyright (c) 2026, the qudi developers. qudi is free software licensed under LG
 see the qudi-iqo-modules LICENSE files.
 """
 
-__all__ = ['FORMAT_VERSION', 'PulseJsonError', 'export_to_json', 'import_from_json']
+__all__ = ['FORMAT_VERSION', 'PulseJsonError', 'export_to_json', 'import_from_json',
+           'play_ready']
 
 import copy
 import json
 import numbers
+import os
+import time
 
 import numpy as np
 
@@ -341,6 +344,169 @@ def import_from_json(source, sequence_generator_logic=None, save=True):
     return created
 
 
+# ------------------------------------------------------------ play-ready (T24, one call)
+
+# HARD BOUNDARY (consultant T24, owner-approved 2026-08-15): this string is embedded in the
+# docstring AND in every summary this function returns. Changing it is a policy change.
+_NO_OUTPUT_NOTE = (
+    'STOPPED at "loaded, ready to play". Output-enable is NOT part of this call: turning the '
+    'pulser output ON is a deliberate human/GUI action under the setup safety chain '
+    '(SAFE-005 / RF-ON discipline). No argument to play_ready() enables the output, and it '
+    'never calls pulser_on / set_status / any output-enable path.')
+
+
+def play_ready(file_path, sequence_generator_logic, assets=None):
+    """Import a pulse-JSON file and take its assets all the way to LOADED-AND-READY — sampled
+    onto the pulse generator and loaded into its channels — WITHOUT ever enabling the output.
+
+    Pipeline per asset: import_from_json (validate + save) -> sample_pulse_block_ensemble /
+    sample_pulse_sequence -> load_ensemble / load_sequence. It stops there. The pulser is left
+    with a waveform/sequence loaded but its output OFF.
+
+    HARD BOUNDARY (T24): output-enable is NOT part of this call. Turning the pulser output ON
+    is a deliberate human/GUI action under the setup safety chain (SAFE-005 / RF-ON
+    discipline). No argument to play_ready() enables the output; it never calls pulser_on /
+    set_status / any output-enable path. The same statement is returned in summary['note'] and
+    summary['output_enabled'] is always False.
+
+    Failure containment: import is all-or-nothing (a single unknown sampling function rejects
+    the whole file before anything is saved or sampled). After import, each asset is sampled
+    then loaded independently inside its own try/except; a failure on one asset never leaves
+    another in a half-known state. The returned summary reports, per asset, exactly whether it
+    is saved / sampled / loaded, so nothing is ambiguous.
+
+    @param str file_path: path to a .pulse.json file (or a JSON string — same detection as
+           import_from_json)
+    @param SequenceGeneratorLogic sequence_generator_logic: a RUNNING SequenceGeneratorLogic
+           (its pulsegenerator() is the device that gets the waveforms/sequences). Required.
+    @param list assets: optional list of ensemble/sequence NAMES to sample+load. Default None
+           = every ensemble and every sequence imported from the file. Blocks are never
+           sampled/loaded directly (they are building blocks); a name that is neither a saved
+           ensemble nor a saved sequence after import is reported as an error, not guessed.
+    @return dict: summary with keys
+            'file', 'output_enabled' (always False), 'imported' {blocks,ensembles,sequences},
+            'requested' (asset names acted on), 'assets' (per-asset records with
+            type/saved/sampled/loaded/sample_s/load_s/error), 'ready_to_play' (names loaded),
+            'ok' (bool: every requested asset loaded), and 'note' (the hard-boundary text).
+    """
+    if sequence_generator_logic is None:
+        raise PulseJsonError('play_ready requires a running SequenceGeneratorLogic instance '
+                             '(sampling and loading target its pulsegenerator()).')
+    sgl = sequence_generator_logic
+
+    # ---- stage 1: import (all-or-nothing; save=True so the stock save path persists them).
+    # A rejected file raises here — nothing sampled, nothing loaded (acceptance case b).
+    created = import_from_json(file_path, sgl, save=True)
+    imported = {'blocks': [b.name for b in created['blocks']],
+                'ensembles': [e.name for e in created['ensembles']],
+                'sequences': [s.name for s in created['sequences']]}
+
+    # ---- resolve which assets to sample+load
+    if assets is None:
+        requested = [(n, 'ensemble') for n in imported['ensembles']] + \
+                    [(n, 'sequence') for n in imported['sequences']]
+    else:
+        requested = []
+        for name in assets:
+            if name in sgl.saved_pulse_block_ensembles:
+                requested.append((name, 'ensemble'))
+            elif name in sgl.saved_pulse_sequences:
+                requested.append((name, 'sequence'))
+            else:
+                requested.append((name, 'unknown'))
+
+    summary = {'file': file_path if isinstance(file_path, str)
+               and not file_path.strip().startswith('{') else '<json-string>',
+               'output_enabled': False,   # HARD BOUNDARY — never flips true in this function
+               'imported': imported,
+               'requested': [n for n, _ in requested],
+               'assets': [],
+               'ready_to_play': [],
+               'ok': True,
+               'note': _NO_OUTPUT_NOTE}
+
+    # ---- stage 2+3: sample then load, per asset, each isolated
+    for name, kind in requested:
+        rec = {'name': name, 'type': kind, 'saved': kind in ('ensemble', 'sequence'),
+               'sampled': False, 'loaded': False, 'sample_s': None, 'load_s': None,
+               'error': None}
+        try:
+            if kind == 'unknown':
+                raise PulseJsonError(
+                    'asset "{0}" is neither a saved ensemble nor a saved sequence after '
+                    'import — not sampling/loading a guessed asset.'.format(name))
+            elif kind == 'ensemble':
+                t0 = time.perf_counter()
+                offset_bin, waveforms, _info = sgl.sample_pulse_block_ensemble(name)
+                rec['sample_s'] = time.perf_counter() - t0
+                # sample_pulse_block_ensemble returns (-1, [], {}) on failure
+                rec['sampled'] = (offset_bin != -1) and bool(waveforms)
+                if not rec['sampled']:
+                    raise PulseJsonError('sampling of ensemble "{0}" failed (see the qudi log '
+                                         'for the reason); NOT loading.'.format(name))
+                t0 = time.perf_counter()
+                ret = sgl.load_ensemble(name)
+                rec['load_s'] = time.perf_counter() - t0
+                if ret == -1:
+                    raise PulseJsonError('load refused for ensemble "{0}": the pulser is '
+                                         'already running — switch the output OFF and retry '
+                                         '(play_ready never turns it on).'.format(name))
+                rec['loaded'] = (sgl.loaded_asset == (name, 'PulseBlockEnsemble'))
+                if not rec['loaded']:
+                    raise PulseJsonError('ensemble "{0}" did not become the loaded asset '
+                                         '(loaded_asset={1}).'.format(name, sgl.loaded_asset))
+            else:  # sequence
+                t0 = time.perf_counter()
+                sgl.sample_pulse_sequence(name)   # returns None on success; check post-cond
+                rec['sample_s'] = time.perf_counter() - t0
+                rec['sampled'] = name in sgl.sampled_sequences
+                if not rec['sampled']:
+                    raise PulseJsonError('sampling of sequence "{0}" failed (see the qudi log '
+                                         'for the reason); NOT loading.'.format(name))
+                t0 = time.perf_counter()
+                ret = sgl.load_sequence(name)
+                rec['load_s'] = time.perf_counter() - t0
+                if ret == -1:
+                    raise PulseJsonError('load refused for sequence "{0}": the pulser is '
+                                         'already running — switch the output OFF and retry '
+                                         '(play_ready never turns it on).'.format(name))
+                rec['loaded'] = (sgl.loaded_asset == (name, 'PulseSequence'))
+                if not rec['loaded']:
+                    raise PulseJsonError('sequence "{0}" did not become the loaded asset '
+                                         '(loaded_asset={1}).'.format(name, sgl.loaded_asset))
+        except Exception as err:
+            rec['error'] = str(err)
+        summary['assets'].append(rec)
+        if rec['loaded']:
+            summary['ready_to_play'].append(name)
+        else:
+            summary['ok'] = False
+
+    return summary
+
+
+def _format_play_ready_summary(summary):
+    """Render a play_ready() summary as human-readable lines (used by the --load CLI)."""
+    lines = ['play_ready: {0}'.format(summary['file']),
+             '  imported: {0} block(s), {1} ensemble(s), {2} sequence(s)'.format(
+                 len(summary['imported']['blocks']), len(summary['imported']['ensembles']),
+                 len(summary['imported']['sequences'])),
+             '  output_enabled: {0}  (HARD BOUNDARY — always False)'.format(
+                 summary['output_enabled'])]
+    for rec in summary['assets']:
+        def _ms(v):
+            return '{0:.0f} ms'.format(v * 1e3) if isinstance(v, float) else '-'
+        status = 'READY' if rec['loaded'] else 'NOT READY'
+        lines.append('  [{0:9s}] {1} "{2}"  saved={3} sampled={4}({5}) loaded={6}({7})'.format(
+            status, rec['type'], rec['name'], rec['saved'], rec['sampled'], _ms(rec['sample_s']),
+            rec['loaded'], _ms(rec['load_s'])))
+        if rec['error']:
+            lines.append('              error: {0}'.format(rec['error']))
+    lines.append('  ready_to_play: {0}'.format(summary['ready_to_play'] or '(none)'))
+    lines.append('  {0}'.format(summary['note']))
+    return '\n'.join(lines)
+
+
 # ---------------------------------------------------------------------------- CLI (T20)
 
 def _cli_persist(created, assets_dir=None):
@@ -374,25 +540,65 @@ def _cli_persist(created, assets_dir=None):
     return directory
 
 
-def _main(argv):
-    """CLI: python -m qudi.logic.pulsed.pulsed_json_io <file.pulse.json> [more...]
+# The supported route for --load: run inside the RUNNING qudi manager's console, where the
+# live SequenceGeneratorLogic instance is already in scope. This is deliberately NOT an
+# out-of-process rpyc attach — qudi shares logic modules over rpyc only when explicitly
+# configured, its device calls are netobtain()-proxied, and half-driving a real pulser from a
+# separate process is exactly what the setup safety chain (SAFE-005 / RF-ON) guards against.
+_LOAD_CONSOLE_ROUTE = (
+    "--load cannot run headless: sampling+loading needs the RUNNING qudi's live pulse\n"
+    "generator. The supported route is the qudi manager console (where the logic module is\n"
+    "already in scope). Run there:\n\n"
+    "    from qudi.logic.pulsed.pulsed_json_io import play_ready\n"
+    "    summary = play_ready(r'{path}', sequencegeneratorlogic)\n"
+    "    print(summary['ok'], summary['ready_to_play'])\n\n"
+    "It imports, samples, and loads — and STOPS there. It never enables the output; turning\n"
+    "the pulser ON stays a deliberate GUI/human action (SAFE-005 / RF-ON discipline).\n"
+    "To persist assets WITHOUT a running qudi, drop --load: import-only pickles them into the\n"
+    "saved-assets dir and the GUI picks them up at next start / via 'Import JSON…' refresh.")
 
-    Imports each file through the SAME validated import_from_json path (all-or-nothing per
-    file: a rejected file writes nothing) and persists via the stock pickle helpers into the
-    saved-assets dir — no running qudi required. Works with a running qudi too, but its GUI
-    lists refresh only at the next qudi start or via the pulsed GUI 'Import JSON…' refresh.
-    Per-file OK/FAIL summary; nonzero exit on any failure.
+
+def _main(argv):
+    """CLI: python -m qudi.logic.pulsed.pulsed_json_io <file.pulse.json> [more...] [--load]
+
+    Default (no --load): imports each file through the SAME validated import_from_json path
+    (all-or-nothing per file: a rejected file writes nothing) and persists via the stock
+    pickle helpers into the saved-assets dir — no running qudi required. GUI lists refresh at
+    the next qudi start or via the pulsed GUI 'Import JSON…' refresh. Per-file OK/FAIL
+    summary; nonzero exit on any failure.
+
+    --load: take assets all the way to loaded-and-ready (import -> sample -> load) via
+    play_ready(). This needs a RUNNING qudi and its live pulse generator, which is only
+    reachable from the qudi manager console — so the CLI prints the exact console one-liner
+    and exits nonzero rather than attempting a fragile/unsafe out-of-process attach. --load
+    NEVER enables the pulser output. Import-only still works by omitting --load.
     """
     import argparse
     parser = argparse.ArgumentParser(
         prog='python -m qudi.logic.pulsed.pulsed_json_io',
         description='Import pulse-sequence JSON file(s) into the qudi saved-assets '
                     'directory (no running qudi needed). Validates via the same path the '
-                    'GUI uses; v2 display labels are stripped (qudi objects carry none).')
+                    'GUI uses; v2 display labels are stripped (qudi objects carry none). '
+                    'Use --load to go all the way to loaded-and-ready via the qudi console.')
     parser.add_argument('files', nargs='+', help='.pulse.json file(s) to import')
     parser.add_argument('--assets-dir', default=None,
                         help='override the saved_pulsed_assets directory')
+    parser.add_argument('--load', action='store_true',
+                        help='sample + load onto the pulser (loaded, NOT playing) — requires '
+                             'a running qudi; prints the supported console one-liner. Never '
+                             'enables the output.')
     args = parser.parse_args(argv)
+
+    if args.load:
+        # Loading needs the running qudi's live device; the CLI cannot obtain it headless.
+        # Emit the supported console route per file and fail clearly (import-only still works).
+        for path in args.files:
+            print('LOAD  {0}'.format(path))
+            print(_LOAD_CONSOLE_ROUTE.format(path=path))
+            print('')
+        print('--load is not available headless — see the console route above. '
+              '(import-only works: re-run without --load.)')
+        return 2
 
     n_ok = n_fail = 0
     for path in args.files:
