@@ -578,15 +578,26 @@ class PulsedMeasurementGui(GuiBase):
             box(self._mw, 'Import & Load (transient)',
                 '{0} asset(s) loaded onto the pulser (loaded, NOT playing):\n  {1}\n\n'
                 'Removed {2} imported block(s) from the saved pool (ensembles/sequences kept).\n\n'
-                'The output was NOT enabled — turn the pulser ON yourself when ready.\n\n'
+                'This action issued no output-enable command — turn the pulser ON yourself when '
+                'ready. (Device caveat: on Tektronix AWG configs the stock load step can close '
+                'the output relay on its own; the confocal Pulse Streamer does not.)\n\n'
                 '{3}'.format(n_ready, ', '.join(summary['ready_to_play']) or '(none)',
                              n_removed, summary['transient_note']))
         except Exception as err:
             self.log.error('Import & Load (transient) failed for "{0}": {1}'.format(file_path,
                                                                                     err))
+            # N1: a raise from import/collision (BEFORE any save) changed nothing; a raise from
+            # the post-load removal stage leaves assets imported/sampled/loaded. play_ready
+            # reports the latter in summary['removal_error'] rather than raising, so reaching
+            # this branch is a pre-load rejection — but word it so a later failure mode can't
+            # mislead: point the operator at the loaded-asset label rather than promising
+            # nothing changed.
             QtWidgets.QMessageBox.critical(
-                self._mw, 'Import & Load (transient) — rejected',
-                'Nothing changed:\n\n{0}'.format(err))
+                self._mw, 'Import & Load (transient) — failed',
+                'Import did not complete. If this was a validation/collision error nothing was '
+                'changed; otherwise check the pulse-generator loaded-asset label and the block '
+                'list, as some assets may have been loaded before the failure:\n\n{0}'
+                ''.format(err))
         finally:
             self._mw.action_import_load_transient.setEnabled(True)
 

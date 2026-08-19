@@ -52,14 +52,14 @@ __all__ = ['FORMAT_VERSION', 'PulseJsonError', 'export_to_json', 'import_from_js
 
 import copy
 import json
+import math
 import numbers
 import os
 import time
 
 import numpy as np
 
-from qudi.logic.pulsed.pulse_objects import (PulseBlock, PulseBlockElement,
-                                             PulseBlockEnsemble, PulseSequence)
+from qudi.logic.pulsed.pulse_objects import (PulseBlock, PulseBlockEnsemble, PulseSequence)
 from qudi.logic.pulsed.sampling_functions import SamplingFunctions
 
 FORMAT_VERSION = 2
@@ -71,6 +71,23 @@ _CONTAINER_KEYS = {'format_version', 'blocks', 'ensembles', 'sequences'}
 class PulseJsonError(ValueError):
     """Raised on any violation of the pulse-sequence JSON exchange contract (v1/v2)."""
     pass
+
+
+def _reject_non_finite(constant_str):
+    """json.loads parse_constant hook: the bare literals NaN / Infinity / -Infinity are
+    rejected (contract §2 rule 1). Import must be as strict as export (which uses
+    allow_nan=False); stock PulseBlockElement.__init__ validates nothing (FIXME on
+    pulse_objects.py), so this importer is the only gate before a non-finite value reaches
+    the device."""
+    raise PulseJsonError('non-finite number "{0}" is not representable in pulse-JSON '
+                         '(contract §2 rule 1) — REJECTING.'.format(constant_str))
+
+
+def _finite_number(value):
+    """True for a real, finite number that is not a bool. Catches overflow-to-inf too
+    (e.g. 1e400 parses to inf as an ordinary float, so parse_constant never sees it)."""
+    return (isinstance(value, numbers.Real) and not isinstance(value, bool)
+            and math.isfinite(value))
 
 
 def _check_label(obj, where):
@@ -177,6 +194,15 @@ def _validate_element_dict(element_dict, where, allow_label=False):
             '{0}: element DATA keys must be exactly {1}; got {2}.{3}(Contract §3 — the '
             'element DATA dict feeds the PulseBlockElement constructor verbatim.)'.format(
                 where, sorted(_ELEMENT_KEYS), sorted(keys), extra))
+    # B3/§2.1: init_length_s and increment_s must be finite real numbers. json.loads'
+    # parse_constant already rejected the bare NaN/Infinity literals; this also catches
+    # overflow-to-inf (1e400) and non-numeric/string durations before the stock constructor
+    # (which validates nothing — FIXME on PulseBlockElement.__init__).
+    for fld in ('init_length_s', 'increment_s'):
+        if not _finite_number(element_dict[fld]):
+            raise PulseJsonError(
+                '{0}: "{1}" must be a finite real number (contract §2 rule 1); got {2!r}.'
+                ''.format(where, fld, element_dict[fld]))
     known = _known_sampling_functions()
     pf = element_dict['pulse_function']
     if not isinstance(pf, dict):
@@ -194,6 +220,15 @@ def _validate_element_dict(element_dict, where, allow_label=False):
         if not isinstance(sf['params'], dict):
             raise PulseJsonError('{0}: sampling-function params must be a JSON object.'
                                  ''.format(where))
+        # N8/B3: reject non-finite numeric params (an unbounded amplitude/frequency ends at
+        # the pulse generator's DAC). Non-numeric params (strings/bools) are left to the
+        # stock sampling-function constructor; only finiteness is enforced here.
+        for pk, pv in sf['params'].items():
+            if isinstance(pv, numbers.Real) and not isinstance(pv, bool) \
+                    and not math.isfinite(pv):
+                raise PulseJsonError(
+                    '{0}: sampling-function param "{1}" on channel {2} is non-finite '
+                    '(contract §2 rule 1) — REJECTING.'.format(where, pk, chnl))
 
 
 def _normalize_block_list(block_list, where):
@@ -239,7 +274,7 @@ def import_from_json(source, sequence_generator_logic=None, save=True):
     """
     raw = _read_raw_text(source)
     try:
-        container = json.loads(raw)
+        container = json.loads(raw, parse_constant=_reject_non_finite)   # B3: no NaN/Infinity
     except json.JSONDecodeError as err:
         raise PulseJsonError('Not valid JSON: {0}'.format(err)) from err
 
@@ -266,9 +301,13 @@ def import_from_json(source, sequence_generator_logic=None, save=True):
     # ---- blocks (dependency order, contract §7)
     block_names = set()
     for blk_dict in container.get('blocks', []):
+        # N6: guard the type BEFORE 'label' in blk_dict (membership on a non-dict — int/None —
+        # would raise a raw TypeError instead of a clean PulseJsonError).
+        if not isinstance(blk_dict, dict):
+            raise PulseJsonError('Block entries must be JSON objects (contract §4).')
         block_keys = {'name', 'element_list'} | ({'label'} if allow_label
                                                  and 'label' in blk_dict else set())
-        if not isinstance(blk_dict, dict) or set(blk_dict) != block_keys:
+        if set(blk_dict) != block_keys:
             raise PulseJsonError('Block entries must carry exactly "name" and '
                                  '"element_list"'
                                  + (' (plus an optional v2 "label")' if allow_label else '')
@@ -353,11 +392,27 @@ def import_from_json(source, sequence_generator_logic=None, save=True):
 
 # HARD BOUNDARY (consultant T24, owner-approved 2026-08-15): this string is embedded in the
 # docstring AND in every summary this function returns. Changing it is a policy change.
+# B2/SAFE-006 (reviewer 2026-08-19): the no-output claim is exact at the LOGIC layer only.
+# This module/call issues no output-enable command — but two Tektronix drivers in this fork
+# apply a DEFERRED "OUTPut … ON" INSIDE load_waveform when an output intent is already latched
+# (tektronix_awg2041.py:822, tektronix_awg5014c.py:708 — the AWG-002 pattern). So on an
+# AWG-driven config, the load step can close the output relay even though nothing here enabled
+# it. The confocal live pulser is the Pulse Streamer, whose load_waveform only builds the
+# sequence object (no relay) — the physical boundary holds there today.
+_DRIVER_OUTPUT_CAVEAT = (
+    'This call issues no output-enable command. DEVICE CAVEAT: on Tektronix AWG drivers '
+    '(awg2041/awg5014c) the stock load_waveform applies a deferred OUTPut…ON if an output '
+    'intent is already latched, so LOADING can close the output relay on those configs. On the '
+    'confocal Pulse Streamer load_waveform builds only the sequence object (no relay).')
+
 _NO_OUTPUT_NOTE = (
-    'STOPPED at "loaded, ready to play". Output-enable is NOT part of this call: turning the '
-    'pulser output ON is a deliberate human/GUI action under the setup safety chain '
-    '(SAFE-005 / RF-ON discipline). No argument to play_ready() enables the output, and it '
-    'never calls pulser_on / set_status / any output-enable path.')
+    'STOPPED at "loaded, ready to play". This call issues NO output-enable command — it never '
+    'calls pulser_on / set_status / any output-enable path, and turning the pulser output ON is '
+    'a deliberate human/GUI action under the setup safety chain (SAFE-005 / RF-ON discipline). '
+    'DEVICE CAVEAT (B2/SAFE-006): on Tektronix AWG drivers the stock load_waveform may apply a '
+    'deferred OUTPut…ON of its own, so on those configs loading can close the output relay even '
+    'though this module enabled nothing (the confocal Pulse Streamer does not — no relay in its '
+    'load_waveform). See summary["driver_output_caveat"].')
 
 
 # TRANSIENT-import re-sample limitation (consultant T26, owner-approved 2026-08-16): embedded
@@ -378,11 +433,16 @@ def play_ready(file_path, sequence_generator_logic, assets=None, transient=False
     sample_pulse_sequence -> load_ensemble / load_sequence. It stops there. The pulser is left
     with a waveform/sequence loaded but its output OFF.
 
-    HARD BOUNDARY (T24): output-enable is NOT part of this call. Turning the pulser output ON
-    is a deliberate human/GUI action under the setup safety chain (SAFE-005 / RF-ON
-    discipline). No argument to play_ready() enables the output; it never calls pulser_on /
-    set_status / any output-enable path. The same statement is returned in summary['note'] and
-    summary['output_enabled'] is always False.
+    HARD BOUNDARY (T24, refined per SAFE-006): this call issues NO output-enable command — no
+    argument enables the output and it never calls pulser_on / set_status / any output-enable
+    path (summary['output_enable_call_made'] is always False). Turning the pulser output ON is a
+    deliberate human/GUI action under the setup safety chain (SAFE-005 / RF-ON discipline).
+    DEVICE CAVEAT (B2/SAFE-006): on Tektronix AWG drivers (awg2041/awg5014c) the stock
+    load_waveform applies a deferred OUTPut…ON if an output intent is already latched, so on
+    those configs the LOAD step can close the output relay even though this module enabled
+    nothing — see summary['driver_output_caveat']. The confocal Pulse Streamer's load_waveform
+    builds only the sequence object (no relay), so the physical boundary holds there today.
+    summary['output_enabled'] stays False (this module's own intent).
 
     TRANSIENT import (T26): with transient=True, after everything is loaded the block(s) THIS
     call added to the saved pool are removed (memory + disk) so the saved-blocks list is not
@@ -439,7 +499,8 @@ def play_ready(file_path, sequence_generator_logic, assets=None, transient=False
     # pre-existing asset. Non-transient imports keep the stock overwrite behaviour (T24).
     if transient:
         try:
-            container = json.loads(_read_raw_text(file_path))
+            container = json.loads(_read_raw_text(file_path),
+                                   parse_constant=_reject_non_finite)   # B3 in the pre-scan too
         except (json.JSONDecodeError, OSError) as err:
             raise PulseJsonError('transient import could not read/parse the file for the '
                                  'collision pre-check: {0}'.format(err)) from err
@@ -459,6 +520,17 @@ def play_ready(file_path, sequence_generator_logic, assets=None, transient=False
                     '{0}. A transient import must not overwrite/remove anything pre-existing; '
                     'rename in the file or delete the saved asset(s) first.'
                     ''.format(', '.join(collisions)))
+        # N3: qudi's sampler injects a FIXED-name 'idle_extension' block at non-unit
+        # granularity (sequence_generator_logic.py:1756). If one is already saved, a
+        # transient sample would overwrite it (stock defect, known_issue CODE-005) AND the
+        # snapshot diff would then NOT remove it (it is in blocks_before) — leaving the pool
+        # polluted. Refuse rather than silently do either.
+        if 'idle_extension' in sgl.saved_pulse_blocks:
+            raise PulseJsonError(
+                'transient import REFUSED — a saved block named "idle_extension" already '
+                'exists. qudi reuses that fixed name for its granularity-padding helper, so a '
+                'transient sample would overwrite it and leave the pool polluted (known_issue '
+                'CODE-005). Delete the saved "idle_extension" block first.')
 
     # snapshot the block pool so we can remove EXACTLY what this call adds (imported blocks +
     # any sampler-injected idle_extension), never a pre-existing block.
@@ -496,8 +568,14 @@ def play_ready(file_path, sequence_generator_logic, assets=None, transient=False
                'ready_to_play': [],
                'ok': True,
                'note': _NO_OUTPUT_NOTE,
+               'output_enable_call_made': False,   # B2: this module issues NO enable call —
+               # but see 'note'/'driver_output_caveat': a Tektronix driver's load_waveform may
+               # apply a DEFERRED OUTPut…ON of its own (awg2041.py:822 / awg5014c.py:708).
+               'driver_output_caveat': _DRIVER_OUTPUT_CAVEAT,
+               'loaded_asset_final': None,   # N2: only the LAST loaded asset stays in channels
                'transient': transient,
                'removed': {'blocks': [], 'ensembles': [], 'sequences': []},
+               'removal_error': None,        # N1: set if stage-4 transient removal partly failed
                'transient_note': ''}
 
     # ---- stage 2+3: sample then load, per asset, each isolated
@@ -557,23 +635,45 @@ def play_ready(file_path, sequence_generator_logic, assets=None, transient=False
         else:
             summary['ok'] = False
 
+    summary['loaded_asset_final'] = sgl.loaded_asset   # N2: the only asset actually in channels
+
     # ---- stage 4 (transient, T26): drop this call's construction plan from the saved pool.
     # The loaded waveform stays in pulser memory (replayable); only the qudi-side objects go.
+    # N1: wrapped so a removal failure (e.g. a Windows PermissionError from os.remove) does not
+    # swallow the summary — assets were imported/sampled/loaded and the caller must be told.
     if transient:
-        # blocks: remove EXACTLY what this call added to the pool = imported blocks + any
-        # sampler-injected idle_extension. Snapshot difference => never a pre-existing block.
-        blocks_to_remove = set(sgl.saved_pulse_blocks) - blocks_before
-        for name in sorted(blocks_to_remove):
-            sgl.delete_block(name)
-            summary['removed']['blocks'].append(name)
-        if transient == 'all':
-            for name in sorted(set(sgl.saved_pulse_block_ensembles) - ensembles_before):
-                sgl.delete_ensemble(name)
-                summary['removed']['ensembles'].append(name)
-            for name in sorted(set(sgl.saved_pulse_sequences) - sequences_before):
-                sgl.delete_sequence(name)
-                summary['removed']['sequences'].append(name)
-        summary['transient_note'] = _TRANSIENT_NOTE
+        try:
+            # blocks: remove EXACTLY what this call added to the pool = imported blocks + any
+            # sampler-injected idle_extension. Snapshot difference => never a pre-existing block.
+            for name in sorted(set(sgl.saved_pulse_blocks) - blocks_before):
+                sgl.delete_block(name)   # delete_block touches no device (block has no waveform)
+                summary['removed']['blocks'].append(name)
+            if transient == 'all':
+                # B1 (CODE-003): stock delete_ensemble/delete_sequence call _delete_waveform /
+                # _delete_sequence when sampling_information is set — which sampling just
+                # populated — so a naive delete would ERASE the just-loaded waveform from pulser
+                # memory, contradicting the replay-still-works promise. Clear sampling_information
+                # on the to-be-deleted pooled object FIRST so stock skips the device call; the
+                # waveform stays loaded and replayable, only the pool object + disk file go.
+                for name in sorted(set(sgl.saved_pulse_block_ensembles) - ensembles_before):
+                    ens = sgl.get_ensemble(name)
+                    if ens is not None:
+                        ens.sampling_information = dict()
+                        sgl.save_ensemble(ens)   # persist the cleared state before deleting
+                    sgl.delete_ensemble(name)
+                    summary['removed']['ensembles'].append(name)
+                for name in sorted(set(sgl.saved_pulse_sequences) - sequences_before):
+                    seq = sgl.get_sequence(name)
+                    if seq is not None:
+                        seq.sampling_information = dict()
+                        sgl.save_sequence(seq)
+                    sgl.delete_sequence(name)
+                    summary['removed']['sequences'].append(name)
+            summary['transient_note'] = _TRANSIENT_NOTE
+        except Exception as err:
+            summary['removal_error'] = str(err)
+            summary['ok'] = False
+            summary['transient_note'] = _TRANSIENT_NOTE
 
     return summary
 
@@ -595,7 +695,11 @@ def _format_play_ready_summary(summary):
             rec['loaded'], _ms(rec['load_s'])))
         if rec['error']:
             lines.append('              error: {0}'.format(rec['error']))
-    lines.append('  ready_to_play: {0}'.format(summary['ready_to_play'] or '(none)'))
+    lines.append('  ready_to_play: {0} (only the LAST stays in the channels: {1})'.format(
+        summary['ready_to_play'] or '(none)', summary.get('loaded_asset_final')))
+    if summary.get('removal_error'):
+        lines.append('  REMOVAL ERROR (assets ARE imported/loaded; pool may be half-removed): '
+                     '{0}'.format(summary['removal_error']))
     if summary.get('transient'):
         rem = summary['removed']
         lines.append('  transient={0} — removed from saved pool: {1} block(s){2}'.format(
@@ -654,8 +758,11 @@ _LOAD_CONSOLE_ROUTE = (
     "    from qudi.logic.pulsed.pulsed_json_io import play_ready\n"
     "    summary = play_ready(r'{path}', sequencegeneratorlogic)\n"
     "    print(summary['ok'], summary['ready_to_play'])\n\n"
-    "It imports, samples, and loads — and STOPS there. It never enables the output; turning\n"
-    "the pulser ON stays a deliberate GUI/human action (SAFE-005 / RF-ON discipline).\n"
+    "It imports, samples, and loads — and STOPS there. It issues no output-enable command;\n"
+    "turning the pulser ON stays a deliberate GUI/human action (SAFE-005 / RF-ON discipline).\n"
+    "DEVICE CAVEAT (SAFE-006): on Tektronix AWG configs the stock load_waveform may apply a\n"
+    "deferred OUTPut…ON, so loading can close the output relay there; the confocal Pulse\n"
+    "Streamer has no such relay in load_waveform.\n"
     "To persist assets WITHOUT a running qudi, drop --load: import-only pickles them into the\n"
     "saved-assets dir and the GUI picks them up at next start / via 'Import JSON…' refresh.")
 
@@ -682,13 +789,17 @@ def _main(argv):
                     'directory (no running qudi needed). Validates via the same path the '
                     'GUI uses; v2 display labels are stripped (qudi objects carry none). '
                     'Use --load to go all the way to loaded-and-ready via the qudi console.')
-    parser.add_argument('files', nargs='+', help='.pulse.json file(s) to import')
+    parser.add_argument('files', nargs='+', help='.pulse.json file(s) to import. NOTE (N7): '
+                        'headless, block/ensemble references are resolved against THE FILE '
+                        'ONLY — a file whose ensemble references an already-persisted block '
+                        '(which the running-qudi GUI would accept) is rejected here. Include '
+                        'the referenced assets in the file for headless import.')
     parser.add_argument('--assets-dir', default=None,
                         help='override the saved_pulsed_assets directory')
     parser.add_argument('--load', action='store_true',
                         help='sample + load onto the pulser (loaded, NOT playing) — requires '
-                             'a running qudi; prints the supported console one-liner. Never '
-                             'enables the output.')
+                             'a running qudi; prints the supported console one-liner. Issues no '
+                             'output-enable command (see the SAFE-006 device caveat).')
     args = parser.parse_args(argv)
 
     if args.load:
