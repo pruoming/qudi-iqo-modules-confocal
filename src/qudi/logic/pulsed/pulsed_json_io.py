@@ -433,6 +433,12 @@ def play_ready(file_path, sequence_generator_logic, assets=None, transient=False
     sample_pulse_sequence -> load_ensemble / load_sequence. It stops there. The pulser is left
     with a waveform/sequence loaded but its output OFF.
 
+    PLAYBACK PRE-FLIGHT (T28): BEFORE importing anything, each block's channel set is compared
+    to the pulser's active activation config. qudi can only sample a block whose channel set
+    EXACTLY equals the active config, so on a mismatch play_ready fails immediately naming the
+    missing/extra channels and the target activation config to re-export the JSON for — rather
+    than letting qudi's opaque "channel activation mismatch" surface mid-sample.
+
     HARD BOUNDARY (T24, refined per SAFE-006): this call issues NO output-enable command — no
     argument enables the output and it never calls pulser_on / set_status / any output-enable
     path (summary['output_enable_call_made'] is always False). Turning the pulser output ON is a
@@ -494,16 +500,47 @@ def play_ready(file_path, sequence_generator_logic, assets=None, transient=False
                              ''.format(transient))
     sgl = sequence_generator_logic
 
+    # Parse once (best-effort) for the T28 playback pre-flight (all modes) and the transient
+    # collision pre-check. A non-finite literal IS a real rejection (propagate); an unreadable /
+    # unparseable source here is left to import_from_json to report authoritatively.
+    try:
+        container = json.loads(_read_raw_text(file_path), parse_constant=_reject_non_finite)
+    except PulseJsonError:
+        raise
+    except (json.JSONDecodeError, OSError):
+        container = None
+
+    # ---- PLAYBACK PRE-FLIGHT (T28, owner request 2026-08-19): qudi's sampler requires a
+    # block's channel set to EXACTLY equal the pulser's active activation config
+    # (_sampling_ensemble_sanity_check) — a mismatch is not an editor nicety, it is why the file
+    # cannot be sampled at all. qudi's own error only says it failed; this names the missing /
+    # extra channels and the target set to re-export for. Fail BEFORE importing → nothing saved.
+    if isinstance(container, dict):
+        active = set(sgl.analog_channels) | set(sgl.digital_channels)
+        if active:   # only meaningful when the pulser reports an activation config
+            for blk in container.get('blocks', []) or []:
+                if not isinstance(blk, dict):
+                    continue
+                block_channels = set()
+                for el in blk.get('element_list', []) or []:
+                    if isinstance(el, dict):
+                        block_channels |= set((el.get('digital_high') or {}).keys())
+                        block_channels |= set((el.get('pulse_function') or {}).keys())
+                if block_channels and block_channels != active:
+                    raise PulseJsonError(
+                        'PLAYBACK PRE-FLIGHT (T28): block "{0}" uses channels {1}, but the '
+                        'pulser active activation config is {2} — qudi requires an EXACT match '
+                        'to sample, so this file cannot be played here. Missing from the block: '
+                        '{3}; extra in the block: {4}. Re-export the JSON with target activation '
+                        'config = {2} (pad every element digital_high to exactly those '
+                        'channels). Nothing was imported.'.format(
+                            blk.get('name'), sorted(block_channels), sorted(active),
+                            sorted(active - block_channels), sorted(block_channels - active)))
+
     # ---- transient guard: reject BEFORE importing if any name in the file collides with an
     # already-saved asset, so import can never overwrite (and transient-removal never delete) a
     # pre-existing asset. Non-transient imports keep the stock overwrite behaviour (T24).
     if transient:
-        try:
-            container = json.loads(_read_raw_text(file_path),
-                                   parse_constant=_reject_non_finite)   # B3 in the pre-scan too
-        except (json.JSONDecodeError, OSError) as err:
-            raise PulseJsonError('transient import could not read/parse the file for the '
-                                 'collision pre-check: {0}'.format(err)) from err
         if isinstance(container, dict):
             collisions = []
             for key, pool in (('blocks', sgl.saved_pulse_blocks),
