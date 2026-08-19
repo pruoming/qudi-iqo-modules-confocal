@@ -214,6 +214,16 @@ def _normalize_block_list(block_list, where):
     return normalized
 
 
+def _read_raw_text(source):
+    """Return the raw JSON text for a source that is either a JSON string (leading '{' after
+    strip) or a file path. Shared by import_from_json and play_ready's collision pre-scan."""
+    text = source.strip() if isinstance(source, str) else ''
+    if text.startswith('{'):
+        return text
+    with open(source, 'r', encoding='utf-8') as fh:
+        return fh.read()
+
+
 def import_from_json(source, sequence_generator_logic=None, save=True):
     """Import a format_version 1 OR 2 JSON container into pulse objects.
 
@@ -227,12 +237,7 @@ def import_from_json(source, sequence_generator_logic=None, save=True):
            (save_block / save_ensemble / save_sequence)
     @return dict: {'blocks': [...], 'ensembles': [...], 'sequences': [...]} created objects
     """
-    text = source.strip() if isinstance(source, str) else ''
-    if text.startswith('{'):
-        raw = text
-    else:
-        with open(source, 'r', encoding='utf-8') as fh:
-            raw = fh.read()
+    raw = _read_raw_text(source)
     try:
         container = json.loads(raw)
     except json.JSONDecodeError as err:
@@ -355,7 +360,17 @@ _NO_OUTPUT_NOTE = (
     'never calls pulser_on / set_status / any output-enable path.')
 
 
-def play_ready(file_path, sequence_generator_logic, assets=None):
+# TRANSIENT-import re-sample limitation (consultant T26, owner-approved 2026-08-16): embedded
+# in the docstring AND returned in summary['transient_note'] whenever transient removal ran.
+_TRANSIENT_NOTE = (
+    'TRANSIENT: the block(s) this call added to the saved pool were REMOVED after load (memory '
+    "+ disk) so the saved-blocks list is not polluted. LIMITATION: a transient asset cannot be "
+    'RE-SAMPLED / regenerated without RE-IMPORTING the JSON file — the loaded waveform can still '
+    'be REPLAYED as-is (it lives in pulser memory, untouched), but qudi has no construction plan '
+    'to rebuild it from. Keep the .pulse.json if you may need to re-sample.')
+
+
+def play_ready(file_path, sequence_generator_logic, assets=None, transient=False):
     """Import a pulse-JSON file and take its assets all the way to LOADED-AND-READY — sampled
     onto the pulse generator and loaded into its channels — WITHOUT ever enabling the output.
 
@@ -368,6 +383,23 @@ def play_ready(file_path, sequence_generator_logic, assets=None):
     discipline). No argument to play_ready() enables the output; it never calls pulser_on /
     set_status / any output-enable path. The same statement is returned in summary['note'] and
     summary['output_enabled'] is always False.
+
+    TRANSIENT import (T26): with transient=True, after everything is loaded the block(s) THIS
+    call added to the saved pool are removed (memory + disk) so the saved-blocks list is not
+    polluted; ensembles/sequences are KEPT (their measurement_information + invoke/generation
+    settings stay usable). transient='all' also removes the ensembles/sequences this call
+    imported. transient=False (default) leaves everything saved — behaviour identical to T24.
+
+      * Only assets THIS call introduced are ever removed. The removal set is computed as a
+        before/after snapshot difference of the pool, so (a) nothing pre-existing is touched,
+        and (b) any helper block qudi's sampler injects to meet waveform granularity
+        ('idle_extension') is also cleaned up. To keep that guarantee airtight, a transient
+        import first REJECTS (before importing anything) if any name in the file collides with
+        an already-saved asset — so import can never overwrite, and later remove, a pre-existing
+        asset.
+      * LIMITATION (documented, prominent): a transient asset CANNOT be re-sampled/regenerated
+        without re-importing the JSON. The loaded waveform replays fine (pulser memory is not
+        touched); only qudi's construction plan is gone. See summary['transient_note'].
 
     Failure containment: import is all-or-nothing (a single unknown sampling function rejects
     the whole file before anything is saved or sampled). After import, each asset is sampled
@@ -383,16 +415,56 @@ def play_ready(file_path, sequence_generator_logic, assets=None):
            = every ensemble and every sequence imported from the file. Blocks are never
            sampled/loaded directly (they are building blocks); a name that is neither a saved
            ensemble nor a saved sequence after import is reported as an error, not guessed.
+    @param transient: False (default) keep everything saved; True remove this call's blocks
+           after load (keep ensembles/sequences); 'all' also remove this call's
+           ensembles/sequences. Any other value is rejected.
     @return dict: summary with keys
             'file', 'output_enabled' (always False), 'imported' {blocks,ensembles,sequences},
             'requested' (asset names acted on), 'assets' (per-asset records with
             type/saved/sampled/loaded/sample_s/load_s/error), 'ready_to_play' (names loaded),
-            'ok' (bool: every requested asset loaded), and 'note' (the hard-boundary text).
+            'ok' (bool: every requested asset loaded), 'note' (the hard-boundary text),
+            'transient' (the mode), 'removed' {blocks,ensembles,sequences}, and
+            'transient_note' (the re-sample limitation text; '' when transient=False).
     """
     if sequence_generator_logic is None:
         raise PulseJsonError('play_ready requires a running SequenceGeneratorLogic instance '
                              '(sampling and loading target its pulsegenerator()).')
+    if transient not in (False, True, 'all'):
+        raise PulseJsonError("transient must be False, True, or 'all'; got {0!r}."
+                             ''.format(transient))
     sgl = sequence_generator_logic
+
+    # ---- transient guard: reject BEFORE importing if any name in the file collides with an
+    # already-saved asset, so import can never overwrite (and transient-removal never delete) a
+    # pre-existing asset. Non-transient imports keep the stock overwrite behaviour (T24).
+    if transient:
+        try:
+            container = json.loads(_read_raw_text(file_path))
+        except (json.JSONDecodeError, OSError) as err:
+            raise PulseJsonError('transient import could not read/parse the file for the '
+                                 'collision pre-check: {0}'.format(err)) from err
+        if isinstance(container, dict):
+            collisions = []
+            for key, pool in (('blocks', sgl.saved_pulse_blocks),
+                              ('ensembles', sgl.saved_pulse_block_ensembles),
+                              ('sequences', sgl.saved_pulse_sequences)):
+                singular = key[:-1]   # blocks->block, ensembles->ensemble, sequences->sequence
+                for entry in container.get(key, []) or []:
+                    nm = entry.get('name') if isinstance(entry, dict) else None
+                    if nm in pool:
+                        collisions.append('{0} "{1}"'.format(singular, nm))
+            if collisions:
+                raise PulseJsonError(
+                    'transient import REFUSED — the file collides with already-saved asset(s): '
+                    '{0}. A transient import must not overwrite/remove anything pre-existing; '
+                    'rename in the file or delete the saved asset(s) first.'
+                    ''.format(', '.join(collisions)))
+
+    # snapshot the block pool so we can remove EXACTLY what this call adds (imported blocks +
+    # any sampler-injected idle_extension), never a pre-existing block.
+    blocks_before = set(sgl.saved_pulse_blocks)
+    ensembles_before = set(sgl.saved_pulse_block_ensembles)
+    sequences_before = set(sgl.saved_pulse_sequences)
 
     # ---- stage 1: import (all-or-nothing; save=True so the stock save path persists them).
     # A rejected file raises here — nothing sampled, nothing loaded (acceptance case b).
@@ -423,7 +495,10 @@ def play_ready(file_path, sequence_generator_logic, assets=None):
                'assets': [],
                'ready_to_play': [],
                'ok': True,
-               'note': _NO_OUTPUT_NOTE}
+               'note': _NO_OUTPUT_NOTE,
+               'transient': transient,
+               'removed': {'blocks': [], 'ensembles': [], 'sequences': []},
+               'transient_note': ''}
 
     # ---- stage 2+3: sample then load, per asset, each isolated
     for name, kind in requested:
@@ -482,6 +557,24 @@ def play_ready(file_path, sequence_generator_logic, assets=None):
         else:
             summary['ok'] = False
 
+    # ---- stage 4 (transient, T26): drop this call's construction plan from the saved pool.
+    # The loaded waveform stays in pulser memory (replayable); only the qudi-side objects go.
+    if transient:
+        # blocks: remove EXACTLY what this call added to the pool = imported blocks + any
+        # sampler-injected idle_extension. Snapshot difference => never a pre-existing block.
+        blocks_to_remove = set(sgl.saved_pulse_blocks) - blocks_before
+        for name in sorted(blocks_to_remove):
+            sgl.delete_block(name)
+            summary['removed']['blocks'].append(name)
+        if transient == 'all':
+            for name in sorted(set(sgl.saved_pulse_block_ensembles) - ensembles_before):
+                sgl.delete_ensemble(name)
+                summary['removed']['ensembles'].append(name)
+            for name in sorted(set(sgl.saved_pulse_sequences) - sequences_before):
+                sgl.delete_sequence(name)
+                summary['removed']['sequences'].append(name)
+        summary['transient_note'] = _TRANSIENT_NOTE
+
     return summary
 
 
@@ -503,6 +596,15 @@ def _format_play_ready_summary(summary):
         if rec['error']:
             lines.append('              error: {0}'.format(rec['error']))
     lines.append('  ready_to_play: {0}'.format(summary['ready_to_play'] or '(none)'))
+    if summary.get('transient'):
+        rem = summary['removed']
+        lines.append('  transient={0} — removed from saved pool: {1} block(s){2}'.format(
+            summary['transient'], len(rem['blocks']),
+            '' if summary['transient'] != 'all' else
+            ', {0} ensemble(s), {1} sequence(s)'.format(len(rem['ensembles']),
+                                                        len(rem['sequences']))))
+        if summary.get('transient_note'):
+            lines.append('  {0}'.format(summary['transient_note']))
     lines.append('  {0}'.format(summary['note']))
     return '\n'.join(lines)
 

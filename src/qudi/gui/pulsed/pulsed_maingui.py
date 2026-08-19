@@ -322,6 +322,19 @@ class PulsedMeasurementGui(GuiBase):
                 break
         (_menu or self._mw.menuBar()).addAction(self._mw.action_import_json)
         self._mw.action_import_json.triggered.connect(self.import_json_clicked)
+        # T26 (owner-approved 2026-08-16): one-step "Import & Load (transient)…" — import,
+        # sample, and load the file's assets onto the pulser (loaded, NOT playing) via
+        # pulsed_json_io.play_ready(transient=True), then drop this call's blocks from the
+        # saved pool so the block list is not polluted. Ensembles/sequences are kept.
+        # HARD BOUNDARY unchanged: this NEVER enables the output — pulser ON stays a human act.
+        self._mw.action_import_load_transient = QtGui.QAction(   # Qt6: QAction is in QtGui
+            'Import && Load (transient)…', self._mw)             # && = one literal & in the label
+        self._mw.action_import_load_transient.setToolTip(
+            'Import a .pulse.json, sample + load it onto the pulser (loaded, not playing), then '
+            'remove the imported blocks from the saved pool. Does NOT enable the output.')
+        (_menu or self._mw.menuBar()).addAction(self._mw.action_import_load_transient)
+        self._mw.action_import_load_transient.triggered.connect(
+            self.import_load_transient_clicked)
         return
 
     def _connect_dialog_signals(self):
@@ -489,6 +502,7 @@ class PulsedMeasurementGui(GuiBase):
         self._mw.action_Settings_Generator.triggered.disconnect()
         self._mw.action_FitSettings.triggered.disconnect()
         self._mw.action_import_json.triggered.disconnect()   # T19
+        self._mw.action_import_load_transient.triggered.disconnect()   # T26
 
     @QtCore.Slot()
     def import_json_clicked(self):
@@ -528,6 +542,53 @@ class PulsedMeasurementGui(GuiBase):
                 'The file was NOT imported — nothing changed:\n\n{0}'.format(err))
         finally:
             self._mw.action_import_json.setEnabled(True)
+
+    @QtCore.Slot()
+    def import_load_transient_clicked(self):
+        """T26: import a .pulse.json, sample + load its assets onto the pulser, then remove the
+        imported blocks from the saved pool (transient) — in one step.
+
+        Delegates to pulsed_json_io.play_ready(transient=True): import (all-or-nothing) ->
+        sample -> load, STOPPING at loaded-and-ready, then dropping this call's blocks (memory +
+        disk) so the block list is not polluted. The ensembles/sequences are kept so their
+        invoke/measurement settings stay usable. HARD BOUNDARY (unchanged): this NEVER enables
+        the output — turning the pulser ON stays a deliberate human action (SAFE-005 / RF-ON).
+        Prominent limitation shown to the user: a transient asset cannot be re-sampled without
+        re-importing the file (the loaded waveform still replays). Errors surface in a dialog +
+        the qudi log with the full text; a rejected/colliding file changes nothing.
+        """
+        from qudi.logic.pulsed.pulsed_json_io import play_ready
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._mw, 'Import & Load (transient) pulse-sequence JSON…', '',
+            'Pulse JSON (*.pulse.json *.json);;All files (*)')
+        if not file_path:
+            return
+        self._mw.action_import_load_transient.setEnabled(False)
+        try:
+            sgl = self.pulsedmasterlogic().sequencegeneratorlogic()
+            summary = play_ready(file_path, sgl, transient=True)
+            n_ready = len(summary['ready_to_play'])
+            n_removed = len(summary['removed']['blocks'])
+            self.log.info('Import & Load (transient) from "{0}": {1} asset(s) loaded '
+                          '({2}); removed {3} block(s) from the saved pool. Output NOT enabled.'
+                          ''.format(file_path, n_ready, ', '.join(summary['ready_to_play'])
+                                    or 'none', n_removed))
+            box = QtWidgets.QMessageBox.information if summary['ok'] else \
+                QtWidgets.QMessageBox.warning
+            box(self._mw, 'Import & Load (transient)',
+                '{0} asset(s) loaded onto the pulser (loaded, NOT playing):\n  {1}\n\n'
+                'Removed {2} imported block(s) from the saved pool (ensembles/sequences kept).\n\n'
+                'The output was NOT enabled — turn the pulser ON yourself when ready.\n\n'
+                '{3}'.format(n_ready, ', '.join(summary['ready_to_play']) or '(none)',
+                             n_removed, summary['transient_note']))
+        except Exception as err:
+            self.log.error('Import & Load (transient) failed for "{0}": {1}'.format(file_path,
+                                                                                    err))
+            QtWidgets.QMessageBox.critical(
+                self._mw, 'Import & Load (transient) — rejected',
+                'Nothing changed:\n\n{0}'.format(err))
+        finally:
+            self._mw.action_import_load_transient.setEnabled(True)
 
     def _disconnect_dialog_signals(self):
         # Connect signals used in predefined methods config dialog
