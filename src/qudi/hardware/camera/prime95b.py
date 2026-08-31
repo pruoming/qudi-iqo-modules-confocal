@@ -116,7 +116,7 @@ class Prime95B(CameraInterface):
 
     def get_size(self):
         """ @return tuple: current image size (width, height) — ROI-dependent """
-        return self.cam.shape
+        return self.cam.shape()  # PyVCAM 2.x: shape(roi_index=0) is a method
 
     def support_live_acquisition(self):
         """ @return bool """
@@ -132,7 +132,7 @@ class Prime95B(CameraInterface):
         """ Stop/abort live or single acquisition. @return bool """
         if self._live:
             self._live = False
-            self.cam.stop_live()
+            self.cam.finish()  # PyVCAM 2.x: finish() ends live/sequence (stop_live is gone)
         return True
 
     def start_single_acquisition(self):
@@ -142,7 +142,9 @@ class Prime95B(CameraInterface):
     def get_acquired_data(self):
         """ @return numpy array: last acquired frame [[row], [row], ...] """
         if self._live:
-            return self.cam.get_live_frame()
+            # PyVCAM 2.x live API: poll_frame() -> (frame_dict, fps, frame_count)
+            frame, _fps, _count = self.cam.poll_frame()
+            return frame['pixel_data']
         return self.cam.get_frame()
 
     def set_exposure(self, exposure):
@@ -226,7 +228,12 @@ class Prime95B(CameraInterface):
             raise RuntimeError('Camera not ready for sequence acquisition (open? live running?).')
         return self.cam.get_sequence(int(num_frames))
 
-    def set_roi(self, x1, x2, y1, y2):
-        """ Single rectangular ROI in sensor pixels (ints): (x_start, x_end, y_start, y_end). """
-        self.cam.roi = (int(x1), int(x2), int(y1), int(y2))
+    def set_roi(self, x_start, y_start, width, height):
+        """ Single rectangular ROI in sensor pixels (ints).
+
+        PyVCAM 2.x signature: set_roi(s1, p1, w, h); reset first so exactly one ROI exists.
+        (The legacy module assigned a (x1, x2, y1, y2) tuple to cam.roi — API removed.)
+        """
+        self.cam.reset_rois()
+        self.cam.set_roi(int(x_start), int(y_start), int(width), int(height))
         return True
