@@ -123,7 +123,13 @@ class Prime95B(CameraInterface):
         return True
 
     def start_live_acquisition(self):
-        """ Start continuous acquisition. @return bool """
+        """ Start continuous acquisition. @return bool
+
+        Always resets the exposure mode to the configured free-running default first:
+        a preceding widefield burst leaves the camera in 'Edge Trigger', and live view
+        would then block forever waiting for triggers that never come.
+        """
+        self.cam.exp_mode = self._exposure_mode
         self.cam.start_live()
         self._live = True
         return True
@@ -142,8 +148,10 @@ class Prime95B(CameraInterface):
     def get_acquired_data(self):
         """ @return numpy array: last acquired frame [[row], [row], ...] """
         if self._live:
-            # PyVCAM 2.x live API: poll_frame() -> (frame_dict, fps, frame_count)
-            frame, _fps, _count = self.cam.poll_frame()
+            # PyVCAM 2.x live API: poll_frame() -> (frame_dict, fps, frame_count).
+            # Finite timeout — the default waits FOREVER and freezes the logic thread
+            # if no frame ever comes (e.g. a triggered mode with no trigger source).
+            frame, _fps, _count = self.cam.poll_frame(timeout_ms=10000)
             return frame['pixel_data']
         return self.cam.get_frame()
 
