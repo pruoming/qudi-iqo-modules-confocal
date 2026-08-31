@@ -217,6 +217,28 @@ class Prime95B(CameraInterface):
         """ @return float: maximum exposure in current PVCAM resolution units """
         return self.cam.get_param(const.PARAM_EXPOSURE_TIME, const.ATTR_MAX)
 
+    def start_frame_sequence(self, num_frames):
+        """ Arm a finite triggered acquisition WITHOUT blocking (poll frames afterwards).
+        Caller contract: exactly num_frames triggers will arrive (design §3 parity guard). """
+        if not self.get_ready_state():
+            raise RuntimeError('Camera not ready to arm a sequence (open? live running?).')
+        self.cam.start_seq(num_frames=int(num_frames))
+        return True
+
+    def poll_next_frame(self, timeout_ms=15000):
+        """ Fetch the next frame of an armed sequence.
+
+        @return tuple: (2D ndarray pixel data, int frame_count from the camera)
+        Raises on timeout — a missing trigger must fail loudly, never silently.
+        """
+        frame, _fps, count = self.cam.poll_frame(timeout_ms=int(timeout_ms))
+        return frame['pixel_data'], count
+
+    def finish_sequence(self):
+        """ End an armed/running sequence acquisition. """
+        self.cam.finish()
+        return True
+
     def get_sequence(self, num_frames):
         """ Blocking finite acquisition of num_frames frames (one per trigger in
         externally triggered modes) — the M2.5/M3 workhorse. Frame parity is the
