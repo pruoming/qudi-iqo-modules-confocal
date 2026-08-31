@@ -218,11 +218,19 @@ class Prime95B(CameraInterface):
         return self.cam.get_param(const.PARAM_EXPOSURE_TIME, const.ATTR_MAX)
 
     def start_frame_sequence(self, num_frames):
-        """ Arm a finite triggered acquisition WITHOUT blocking (poll frames afterwards).
-        Caller contract: exactly num_frames triggers will arrive (design §3 parity guard). """
+        """ Arm a triggered acquisition WITHOUT blocking (poll frames afterwards).
+        Caller contract: exactly num_frames triggers will arrive (design §3 parity guard).
+
+        Implementation note (2026-08-31): uses LIVE/circular-buffer mode, not
+        start_seq — finite-sequence acquisitions died deterministically at frame 26
+        of 50 (suspected PVCAM sequence-buffer cap; M2.5's 20 frames passed). The
+        ring (up to 64 frames deep) queues triggered frames even if the consumer
+        lags; poll_next_frame(oldestFrame) drains it in order.
+        """
         if not self.get_ready_state():
             raise RuntimeError('Camera not ready to arm a sequence (open? live running?).')
-        self.cam.start_seq(num_frames=int(num_frames))
+        buffer_frames = int(max(16, min(int(num_frames), 64)))
+        self.cam.start_live(buffer_frame_count=buffer_frames)
         return True
 
     def poll_next_frame(self, timeout_ms=15000):
