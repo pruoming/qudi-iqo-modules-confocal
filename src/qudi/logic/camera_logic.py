@@ -177,7 +177,9 @@ class CameraLogic(LogicBase):
                     camera.start_single_acquisition()  # the hardware has to check it's not busy
 
     def create_tag(self, time_stamp):
-        return f"{time_stamp}_captured_frame"
+        # Filesystem-safe: a raw datetime str contains colons, illegal on Windows
+        # (widefield_odmr CAM-003; datastorage prepends its own timestamp anyway).
+        return f"{time_stamp:%Y%m%d-%H%M%S}_captured_frame"
 
     def draw_2d_image(self, data, cbar_range=None):
         # Create image plot
